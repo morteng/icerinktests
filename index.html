@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ice Rink Simulator</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      color: #d0d0d0;
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #error {
+      display: none;
+      background: #6b1a1a;
+      color: #ffa0a0;
+      padding: 20px;
+      text-align: center;
+      font-size: 16px;
+    }
+
+    /* ===== MENU BAR ===== */
+    #menu-bar {
+      height: 34px;
+      min-height: 34px;
+      display: flex;
+      align-items: stretch;
+      background: #10101c;
+      border-bottom: 1px solid #2a2a4a;
+      padding: 0 4px;
+      gap: 1px;
+    }
+    .menu-title {
+      color: #4a7fff;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      padding: 0 12px 0 10px;
+      display: flex;
+      align-items: center;
+      opacity: 0.8;
+    }
+    .menu-badge {
+      margin-left: auto;
+      color: #4a5a6a;
+      font-size: 9px;
+      letter-spacing: 1px;
+      padding: 0 10px;
+      display: flex;
+      align-items: center;
+    }
+    .menu-tab {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #6a6a8a;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 0 16px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .menu-tab:hover { color: #a0a0c0; }
+    .menu-tab.active {
+      color: #d0d0f0;
+      border-bottom-color: #4a7fff;
+    }
+
+    /* ===== APP LAYOUT ===== */
+    #app-body {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* ===== SIDEBAR ===== */
+    #sidebar {
+      width: 220px;
+      min-width: 220px;
+      background: #12162a;
+      border-right: 1px solid #2a2a4a;
+      overflow-y: auto;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    #sidebar::-webkit-scrollbar { width: 4px; }
+    #sidebar::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 2px; }
+    .sidebar-title {
+      text-align: center;
+      color: #8888aa;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      padding: 8px 0 4px;
+      border-bottom: 1px solid #1a1a30;
+    }
+
+    /* ===== SIDEBAR SECTIONS ===== */
+    .sidebar-section {
+      border-bottom: 1px solid #1a1a30;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      color: #8888aa;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      user-select: none;
+    }
+    .section-header:hover { background: #1a1e36; }
+    .section-header .chevron {
+      font-size: 9px;
+      width: 10px;
+      text-align: center;
+    }
+    .section-body {
+      padding: 4px 10px 8px;
+      max-height: 1000px;
+      overflow: hidden;
+      transition: max-height 0.25s ease, padding 0.25s ease;
+    }
+    .section-body.collapsed {
+      max-height: 0;
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+    .sidebar-tab-content {
+      padding: 8px 10px;
+    }
+    .sub-group {
+      color: #6a6a8a;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin: 10px 0 6px;
+      padding-bottom: 3px;
+      border-bottom: 1px solid #222240;
+    }
+
+    /* ===== CONTROLS ===== */
+    .ctrl {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-bottom: 4px;
+    }
+    .ctrl label {
+      color: #8888aa;
+      font-size: 12px;
+      min-width: 52px;
+      flex-shrink: 0;
+    }
+    .ctrl .val {
+      color: #e0e0ff;
+      min-width: 42px;
+      text-align: right;
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+    input[type="range"] {
+      flex: 1;
+      min-width: 0;
+      accent-color: #4a7fff;
+    }
+    input[type="range"].short {
+      max-width: 70px;
+    }
+    select {
+      background: #2a3a5e;
+      color: #c0c0e0;
+      border: 1px solid #4a4a6a;
+      padding: 3px 6px;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 12px;
+      flex: 1;
+      min-width: 0;
+    }
+    button {
+      background: #2a3a5e;
+      color: #c0c0e0;
+      border: 1px solid #4a4a6a;
+      padding: 5px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      transition: background 0.15s;
+    }
+    button:hover { background: #3a4a7e; }
+    button.active { background: #4a5a8e; border-color: #6a7aaa; }
+    .btn-row {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 4px;
+      flex-wrap: wrap;
+    }
+    .btn-row button { flex: 1; min-width: 0; padding: 4px 6px; }
+    .tool-panel {
+      padding: 2px 0;
+    }
+    .tool-panel.hidden { display: none; }
+    .custom-sliders { display: none; }
+    .custom-sliders.show { display: block; }
+    .hidden { display: none !important; }
+
+    /* ===== STICKY PLAYBACK BAR ===== */
+    .sidebar-sticky {
+      background: #161a30;
+      border-bottom: 1px solid #2a2a4a;
+      padding: 6px 10px 8px;
+      flex-shrink: 0;
+    }
+    .sidebar-sticky .btn-row { margin-bottom: 3px; }
+    .sidebar-sticky .ctrl { margin-bottom: 2px; }
+
+    /* ===== MAIN CANVAS ===== */
+    #canvas-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      min-height: 0;
+      min-width: 0;
+    }
+    canvas#canvas {
+      display: block;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+
+    /* ===== CROSS-SECTION ===== */
+    #cross-section-panel {
+      width: 160px;
+      min-width: 160px;
+      display: flex;
+      flex-direction: column;
+      background: #0a0a14;
+      border-left: 1px solid #2a2a4a;
+    }
+    .cs-title {
+      text-align: center;
+      color: #6a6a8a;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 4px 0;
+      border-bottom: 1px solid #1a1a30;
+      background: #10101c;
+    }
+    #cs-canvas-wrap {
+      flex: 1;
+      position: relative;
+      min-height: 0;
+    }
+    canvas#cross-section {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    .cs-lbl {
+      position: absolute;
+      left: 6px;
+      color: #1a1a2e;
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      pointer-events: none;
+      text-shadow:
+        -1px -1px 0 rgba(255,255,255,0.6),
+         1px -1px 0 rgba(255,255,255,0.6),
+        -1px  1px 0 rgba(255,255,255,0.6),
+         1px  1px 0 rgba(255,255,255,0.6),
+         0 0 4px rgba(255,255,255,0.4);
+      transform: translateY(-50%);
+    }
+
+    /* ===== BOTTOM PANEL ===== */
+    #bottom {
+      background: #16213e;
+      border-top: 1px solid #2a2a4a;
+      padding: 5px 12px;
+    }
+    #legend {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    #legend-bar {
+      flex: 1;
+      height: 10px;
+      border-radius: 3px;
+      background: linear-gradient(to right,
+        rgb(38, 0, 77) 0%,
+        rgb(26, 38, 153) 20%,
+        rgb(51, 179, 230) 37%,
+        rgb(230, 242, 255) 43%,
+        rgb(255, 217, 51) 57%,
+        rgb(230, 102, 26) 77%,
+        rgb(153, 13, 13) 100%
+      );
+    }
+    #legend .lbl { color: #8888aa; font-size: 11px; white-space: nowrap; }
+
+    /* ===== STATS PANEL ===== */
+    #stats-panel {
+      display: flex;
+      gap: 2px;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .stats-group {
+      background: #1a1a30;
+      border: 1px solid #2a2a4a;
+      border-radius: 4px;
+      padding: 3px 8px;
+      min-width: 0;
+      flex-shrink: 0;
+    }
+    .stats-group.sg-sim    { width: 120px; }
+    .stats-group.sg-rink   { min-width: 130px; }
+    .stats-group.sg-ice    { min-width: 180px; }
+    .stats-group.sg-temp   { min-width: 155px; }
+    .stats-group.sg-event  { min-width: 95px; }
+    .stats-group-title {
+      color: #6a6a8a;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 1px;
+    }
+    .stats-group .stat-line {
+      color: #a0a0c0;
+      white-space: nowrap;
+    }
+    .stats-group .stat-val {
+      color: #d0d0f0;
+    }
+    .quality-good { color: #4ade80 !important; }
+    .quality-ok { color: #fbbf24 !important; }
+    .quality-bad { color: #f87171 !important; }
+    .quality-bar {
+      display: inline-block;
+      height: 8px;
+      border-radius: 2px;
+      vertical-align: middle;
+      margin-left: 3px;
+    }
+    .event-progress {
+      display: inline-block;
+      width: 60px;
+      height: 6px;
+      background: #2a2a4a;
+      border-radius: 3px;
+      overflow: hidden;
+      vertical-align: middle;
+      margin-left: 4px;
+    }
+    .event-progress-fill {
+      height: 100%;
+      background: #4a7fff;
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div id="error"></div>
+  <div id="app-body">
+    <div id="canvas-container">
+      <canvas id="canvas"></canvas>
+    </div>
+    <div id="cross-section-panel">
+      <div class="cs-title">Cross-Section</div>
+      <div id="cs-canvas-wrap">
+        <canvas id="cross-section"></canvas>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
