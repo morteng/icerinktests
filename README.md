@@ -2,7 +2,7 @@
 
 A WebGPU-based ice rink physics simulator with realistic thermal dynamics, water physics, and resurfacing operations.
 
-🎮 **[Try it live](https://icegame.pages.dev)** (or run locally with `npm run dev`)
+**[Try it live](https://morteng.github.io/icerinktests/)** — runs in any WebGPU-compatible browser (Chrome, Edge, recent Firefox)
 
 ## Features
 
