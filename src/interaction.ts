@@ -31,7 +31,7 @@ export class InteractionManager {
   private lastGridX = 0;
   private lastGridY = 0;
   damageType: DamageType = 'none';
-  toolSettings: ToolSettings = { radius: 6, amount: 0.8, temp: 20, pressure: 5, spread: 5 };
+  toolSettings: ToolSettings = { radius: 6, amount: 3.0, temp: 20, pressure: 5, spread: 5 };
 
   private _damageActive = false;
 
