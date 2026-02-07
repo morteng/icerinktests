@@ -67,6 +67,9 @@ struct SimParams {
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> solids: array<f32>;
 @group(0) @binding(6) var<storage, read_write> scratches: array<u32>;
+// State2: vec4f per cell (snow_density kg/m³, snow_lwc 0-1, mud_amount mm, reserved)
+@group(0) @binding(7) var<storage, read> state2_in: array<vec4f>;
+@group(0) @binding(8) var<storage, read_write> state2_out: array<vec4f>;
 
 fn cell(x: u32, y: u32) -> u32 {
   return y * params.width + x;
@@ -85,11 +88,12 @@ fn cell_noise(x: u32, y: u32) -> f32 {
   return f32(h) / 4294967295.0;
 }
 
-// Water passes through: open(0) and net(2). Blocked by: frame(1), outside-mask (indoor only).
+// Water passes through: open(0) and net(2). Blocked by: frame(1), fence(3,4), outside-mask (indoor only).
 fn is_passable_water(x: u32, y: u32) -> bool {
   let i = cell(x, y);
   if (mask[i] > 0.5) {
-    return solids[i] < 0.5 || solids[i] > 1.5;
+    let s = solids[i];
+    return s < 0.5 || (s > 1.5 && s < 2.5); // only net(2) passes water
   }
   return params.is_outdoor > 0u;
 }
@@ -117,6 +121,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   // Indoor rinks: skip cells outside mask entirely
   if (!inside_mask && params.is_outdoor == 0u) {
     state_out[i] = vec4f(params.ambient_temp, 0.0, 0.0, 0.0);
+    state2_out[i] = vec4f(0.0, 0.0, 0.0, 0.0);
     return;
   }
 
@@ -125,6 +130,22 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   var ice = s.y;
   var water = s.z;
   var shavings = s.w;
+
+  // State2: snow properties
+  let s2 = state2_in[i];
+  var snow_density = s2.x;   // kg/m³ (0 or 50-917)
+  var snow_lwc = s2.y;       // liquid water content fraction (0-1)
+  var mud = s2.z;             // mud/dirt (mm)
+  var snow_reserved = s2.w;   // reserved
+
+  // Ensure density is valid when snow exists
+  if (shavings > 0.01 && snow_density < 50.0) {
+    snow_density = select(400.0, 80.0, params.is_outdoor > 0u);
+  }
+  if (shavings < 0.01) {
+    snow_density = 0.0;
+    snow_lwc = 0.0;
+  }
 
   // --- Flood: add water if requested (inside rink only) ---
   // Pro rinks: hot zamboni water (40°C). Backyard: garden hose (2°C).
@@ -135,7 +156,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   // --- Snowfall: add snow (shavings) if requested ---
-  shavings += params.snow_amount;
+  if (params.snow_amount > 0.0) {
+    let old_mass = shavings * snow_density;
+    let new_density = 80.0; // fresh falling snow
+    let new_mass = params.snow_amount * new_density;
+    shavings += params.snow_amount;
+    snow_density = select((old_mass + new_mass) / max(shavings, 0.01), new_density, old_mass < 0.01);
+  }
 
   // --- Rain: continuous water accumulation (outdoor, warm conditions) ---
   // Spatial noise makes rain coverage uneven
@@ -184,62 +211,92 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
   T += params.alpha_dt_dx2 * lap;
 
-  // --- Height-field gravity-driven water flow ---
-  // Water flows from high effective surface (ice+water) to low.
+  // --- Height-field gravity-driven water flow (with heat advection) ---
+  // Water flows from high effective surface to low, carrying heat with it.
+  // Snow acts as a physical dam: dense snow blocks water, fresh powder is permeable.
   {
-    let my_surface = ice + water;
+    let snow_barrier_frac = clamp(snow_density / 400.0, 0.0, 1.0);
+    let my_surface = ice + water + shavings * snow_barrier_frac;
     let coupling = params.water_gravity_coupling;
-    var delta_water = 0.0;
+    var water_out = 0.0;   // total water leaving
+    var water_in = 0.0;    // total water arriving
+    var heat_in = 0.0;     // temperature-weighted incoming water (for advection)
 
     // Left neighbor
     if (is_passable_water(xl, y)) {
       let ni = cell(xl, y);
-      let n_surface = state_in[ni].y + state_in[ni].z;
+      let ns = state_in[ni];
+      let nb = ns.w * clamp(state2_in[ni].x / 400.0, 0.0, 1.0);
+      let n_surface = ns.y + ns.z + nb;
       let h_diff = my_surface - n_surface;
       if (h_diff > 0.0 && water > 0.0) {
-        delta_water -= min(h_diff * 0.5 * coupling, water * 0.24);
+        water_out += min(h_diff * 0.5 * coupling, water * 0.24);
       } else if (h_diff < 0.0) {
-        delta_water += min(-h_diff * 0.5 * coupling, state_in[ni].z * 0.24);
+        let inflow = min(-h_diff * 0.5 * coupling, ns.z * 0.24);
+        water_in += inflow;
+        heat_in += inflow * ns.x;
       }
     }
     // Right neighbor
     if (is_passable_water(xr, y)) {
       let ni = cell(xr, y);
-      let n_surface = state_in[ni].y + state_in[ni].z;
+      let ns = state_in[ni];
+      let nb = ns.w * clamp(state2_in[ni].x / 400.0, 0.0, 1.0);
+      let n_surface = ns.y + ns.z + nb;
       let h_diff = my_surface - n_surface;
       if (h_diff > 0.0 && water > 0.0) {
-        delta_water -= min(h_diff * 0.5 * coupling, water * 0.24);
+        water_out += min(h_diff * 0.5 * coupling, water * 0.24);
       } else if (h_diff < 0.0) {
-        delta_water += min(-h_diff * 0.5 * coupling, state_in[ni].z * 0.24);
+        let inflow = min(-h_diff * 0.5 * coupling, ns.z * 0.24);
+        water_in += inflow;
+        heat_in += inflow * ns.x;
       }
     }
     // Up neighbor
     if (is_passable_water(x, yu)) {
       let ni = cell(x, yu);
-      let n_surface = state_in[ni].y + state_in[ni].z;
+      let ns = state_in[ni];
+      let nb = ns.w * clamp(state2_in[ni].x / 400.0, 0.0, 1.0);
+      let n_surface = ns.y + ns.z + nb;
       let h_diff = my_surface - n_surface;
       if (h_diff > 0.0 && water > 0.0) {
-        delta_water -= min(h_diff * 0.5 * coupling, water * 0.24);
+        water_out += min(h_diff * 0.5 * coupling, water * 0.24);
       } else if (h_diff < 0.0) {
-        delta_water += min(-h_diff * 0.5 * coupling, state_in[ni].z * 0.24);
+        let inflow = min(-h_diff * 0.5 * coupling, ns.z * 0.24);
+        water_in += inflow;
+        heat_in += inflow * ns.x;
       }
     }
     // Down neighbor
     if (is_passable_water(x, yd)) {
       let ni = cell(x, yd);
-      let n_surface = state_in[ni].y + state_in[ni].z;
+      let ns = state_in[ni];
+      let nb = ns.w * clamp(state2_in[ni].x / 400.0, 0.0, 1.0);
+      let n_surface = ns.y + ns.z + nb;
       let h_diff = my_surface - n_surface;
       if (h_diff > 0.0 && water > 0.0) {
-        delta_water -= min(h_diff * 0.5 * coupling, water * 0.24);
+        water_out += min(h_diff * 0.5 * coupling, water * 0.24);
       } else if (h_diff < 0.0) {
-        delta_water += min(-h_diff * 0.5 * coupling, state_in[ni].z * 0.24);
+        let inflow = min(-h_diff * 0.5 * coupling, ns.z * 0.24);
+        water_in += inflow;
+        heat_in += inflow * ns.x;
       }
     }
 
     // Noise jitter on water damping for natural variation
     let water_noise = cell_noise(x, y);
     let noisy_damping = params.water_damping * (0.92 + water_noise * 0.16);
-    water = max(water + delta_water * noisy_damping, 0.0);
+    let net_flow = (water_in - water_out) * noisy_damping;
+    water = max(water + net_flow, 0.0);
+
+    // Heat advection: incoming water mixes with cell's thermal mass
+    let effective_inflow = water_in * noisy_damping;
+    if (effective_inflow > 0.001) {
+      let avg_T_in = heat_in / water_in;
+      let thermal_mass = ice * 0.5 + water + shavings * 0.3 + 5.0;
+      let mix_frac = effective_inflow / (thermal_mass + effective_inflow);
+      T = mix(T, avg_T_in, clamp(mix_frac, 0.0, 0.3));
+    }
   }
 
   // --- Board drain: water near mask edge drains (inside rink only) ---
@@ -269,10 +326,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  // --- Air coupling (modulated by snow insulation) ---
-  // Snow is a superb insulator (k≈0.03 W/m/K vs ice k≈2.2 W/m/K).
-  // Even 1-2mm of snow dramatically reduces air-ice heat exchange.
-  let insulation = 1.0 / (1.0 + shavings * params.water_coupling);
+  // --- Air coupling (modulated by snow insulation, density-dependent) ---
+  // Thermal conductivity scales with density: fresh snow k≈0.03, ice k≈2.2 W/m/K
+  // Higher density snow insulates less
+  var snow_k = 0.03;
+  if (shavings > 0.01 && snow_density > 50.0) {
+    snow_k = mix(0.03, 2.2, clamp((snow_density - 50.0) / (917.0 - 50.0), 0.0, 1.0));
+  }
+  // Insulation factor: low k = high insulation, high k = low insulation
+  let insulation_strength = (2.2 / max(snow_k, 0.01)) * params.water_coupling;
+  let insulation = 1.0 / (1.0 + shavings * insulation_strength);
   T += params.air_coupling * insulation * (params.ambient_temp - T);
 
   // --- Phase change ---
@@ -285,7 +348,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   if (T > 0.0 && ice > 0.0) {
-    let can_melt = min(ice, params.melt_rate * T);
+    // Dirty ice melts faster: mud reduces albedo → absorbs more heat
+    let mud_melt_factor = 1.0 + clamp(mud * 5.0, 0.0, 1.0);
+    let can_melt = min(ice, params.melt_rate * T * mud_melt_factor);
     ice -= can_melt;
     water += can_melt;
     T -= can_melt * params.latent_factor;
@@ -322,14 +387,31 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     T -= needed * params.latent_factor;
   }
 
-  // --- Falling-sand snow/shavings (angle of repose + wind drift) ---
+  // --- Snow sublimation: dry cold snow loses mass directly to vapor ---
   let dt = params.sim_dt;
-  let threshold = params.snow_repose_threshold;
-  let tfrac = params.snow_transfer_frac;
+  let wind_strength = sqrt(params.wind_x * params.wind_x + params.wind_y * params.wind_y);
+  if (T < 0.0 && shavings > 0.01 && snow_lwc < 0.02) {
+    let wind_enhance = 1.0 + wind_strength * 0.1;
+    // ~0.5 mm/day at -10°C, increases with wind
+    let sublim = 0.0000005 * abs(T) * wind_enhance * dt;
+    shavings = max(shavings - sublim, 0.0);
+  }
+
+  // --- Falling-sand snow/shavings (angle of repose + wind drift) ---
+  // Dense/packed snow holds steeper walls than fresh powder
+  // Scale threshold by cell size for consistent angle of repose across presets
+  let density_frac_repose = clamp((snow_density - 50.0) / (600.0 - 50.0), 0.0, 1.0);
+  let cell_mm = params.cell_size_m * 1000.0;
+  let threshold = params.snow_repose_threshold * (cell_mm / 80.0) * (1.0 + density_frac_repose * 3.0);
+  let tfrac = params.snow_transfer_frac * (1.0 - density_frac_repose * 0.7);
   var delta_snow = 0.0;
+  var snow_push_total = 0.0;   // total snow pushed away
+  var snow_recv_total = 0.0;   // total snow received
+  var recv_density_sum = 0.0;  // density-weighted received snow
+  var recv_lwc_sum = 0.0;      // lwc-weighted received snow
+  var recv_mud_sum = 0.0;      // proportional mud arriving with snow
 
   // Wind-biased transfer: directional modifiers for cardinal neighbors
-  let wind_strength = sqrt(params.wind_x * params.wind_x + params.wind_y * params.wind_y);
   let wind_factor = min(wind_strength * 0.05, 0.3);
   // Push: wind makes it easier to push downwind, harder upwind
   let wind_push_left  = clamp(1.0 + wind_factor * (-params.wind_x), 0.5, 2.0); // left = -x
@@ -347,72 +429,310 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (is_passable_snow(xl, y)) {
       let diff = shavings - state_in[cell(xl, y)].w;
       if (diff > threshold) {
-        delta_snow -= min((diff - threshold) * 0.5 * tfrac * wind_push_left, shavings * 0.15);
+        let pushed = min((diff - threshold) * 0.5 * tfrac * wind_push_left, shavings * 0.15);
+        delta_snow -= pushed;
+        snow_push_total += pushed;
       }
     }
     if (is_passable_snow(xr, y)) {
       let diff = shavings - state_in[cell(xr, y)].w;
       if (diff > threshold) {
-        delta_snow -= min((diff - threshold) * 0.5 * tfrac * wind_push_right, shavings * 0.15);
+        let pushed = min((diff - threshold) * 0.5 * tfrac * wind_push_right, shavings * 0.15);
+        delta_snow -= pushed;
+        snow_push_total += pushed;
       }
     }
     if (is_passable_snow(x, yu)) {
       let diff = shavings - state_in[cell(x, yu)].w;
       if (diff > threshold) {
-        delta_snow -= min((diff - threshold) * 0.5 * tfrac * wind_push_up, shavings * 0.15);
+        let pushed = min((diff - threshold) * 0.5 * tfrac * wind_push_up, shavings * 0.15);
+        delta_snow -= pushed;
+        snow_push_total += pushed;
       }
     }
     if (is_passable_snow(x, yd)) {
       let diff = shavings - state_in[cell(x, yd)].w;
       if (diff > threshold) {
-        delta_snow -= min((diff - threshold) * 0.5 * tfrac * wind_push_down, shavings * 0.15);
+        let pushed = min((diff - threshold) * 0.5 * tfrac * wind_push_down, shavings * 0.15);
+        delta_snow -= pushed;
+        snow_push_total += pushed;
       }
     }
   }
 
-  // Receive from taller neighbors
+  // Receive from taller neighbors (track properties for mixing)
   if (is_passable_snow(xl, y)) {
-    let diff = state_in[cell(xl, y)].w - shavings;
+    let ni = cell(xl, y);
+    let diff = state_in[ni].w - shavings;
     if (diff > threshold) {
-      delta_snow += min((diff - threshold) * 0.5 * tfrac * wind_recv_left, state_in[cell(xl, y)].w * 0.15);
+      let amount = min((diff - threshold) * 0.5 * tfrac * wind_recv_left, state_in[ni].w * 0.15);
+      delta_snow += amount;
+      snow_recv_total += amount;
+      let ns2 = state2_in[ni];
+      recv_density_sum += amount * ns2.x;
+      recv_lwc_sum += amount * ns2.y;
+      recv_mud_sum += amount * ns2.z * amount / max(state_in[ni].w, 0.01);
     }
   }
   if (is_passable_snow(xr, y)) {
-    let diff = state_in[cell(xr, y)].w - shavings;
+    let ni = cell(xr, y);
+    let diff = state_in[ni].w - shavings;
     if (diff > threshold) {
-      delta_snow += min((diff - threshold) * 0.5 * tfrac * wind_recv_right, state_in[cell(xr, y)].w * 0.15);
+      let amount = min((diff - threshold) * 0.5 * tfrac * wind_recv_right, state_in[ni].w * 0.15);
+      delta_snow += amount;
+      snow_recv_total += amount;
+      let ns2 = state2_in[ni];
+      recv_density_sum += amount * ns2.x;
+      recv_lwc_sum += amount * ns2.y;
+      recv_mud_sum += amount * ns2.z * amount / max(state_in[ni].w, 0.01);
     }
   }
   if (is_passable_snow(x, yu)) {
-    let diff = state_in[cell(x, yu)].w - shavings;
+    let ni = cell(x, yu);
+    let diff = state_in[ni].w - shavings;
     if (diff > threshold) {
-      delta_snow += min((diff - threshold) * 0.5 * tfrac * wind_recv_up, state_in[cell(x, yu)].w * 0.15);
+      let amount = min((diff - threshold) * 0.5 * tfrac * wind_recv_up, state_in[ni].w * 0.15);
+      delta_snow += amount;
+      snow_recv_total += amount;
+      let ns2 = state2_in[ni];
+      recv_density_sum += amount * ns2.x;
+      recv_lwc_sum += amount * ns2.y;
+      recv_mud_sum += amount * ns2.z * amount / max(state_in[ni].w, 0.01);
     }
   }
   if (is_passable_snow(x, yd)) {
-    let diff = state_in[cell(x, yd)].w - shavings;
+    let ni = cell(x, yd);
+    let diff = state_in[ni].w - shavings;
     if (diff > threshold) {
-      delta_snow += min((diff - threshold) * 0.5 * tfrac * wind_recv_down, state_in[cell(x, yd)].w * 0.15);
+      let amount = min((diff - threshold) * 0.5 * tfrac * wind_recv_down, state_in[ni].w * 0.15);
+      delta_snow += amount;
+      snow_recv_total += amount;
+      let ns2 = state2_in[ni];
+      recv_density_sum += amount * ns2.x;
+      recv_lwc_sum += amount * ns2.y;
+      recv_mud_sum += amount * ns2.z * amount / max(state_in[ni].w, 0.01);
     }
   }
 
+  // Apply snow movement with property mixing
+  let old_shavings = shavings;
   shavings = max(shavings + delta_snow, 0.0);
 
-  // Wet snow compaction: snow on water becomes slush
-  // Rate depends on water temperature — warm water absorbs snow much faster
+  // Mix received snow properties (density, lwc, mud) with existing snow
+  if (snow_recv_total > 0.001 && shavings > 0.01) {
+    let remaining = max(old_shavings - snow_push_total, 0.0);
+    snow_density = (snow_density * remaining + recv_density_sum) / max(shavings, 0.01);
+    snow_lwc = (snow_lwc * remaining + recv_lwc_sum) / max(shavings, 0.01);
+    mud += recv_mud_sum;
+  }
+  // Mud leaves with pushed snow (proportional)
+  if (snow_push_total > 0.001 && old_shavings > 0.01) {
+    mud *= (1.0 - min(snow_push_total / old_shavings, 1.0));
+  }
+
+  // --- Water percolation into snow (density-aware) ---
+  // Water infiltrates porous snow; rate depends on porosity (1 - density/917)
   if (water > 0.01 && shavings > 0.01) {
-    let comp_dt = min(dt, 0.1);  // cap compaction timestep to prevent runaway at high sim speed
-    // Temperature factor: warm water (>2°C) absorbs snow rapidly
-    // Near-freezing water (~0°C) absorbs slowly
-    let temp_factor = clamp(T * 0.5 + 0.5, 0.05, 1.0);
-    let absorb = min(shavings, water * 0.01 * comp_dt * temp_factor);
-    // Gravity: snow sinks into water layer
-    let gravity_sink = min(shavings * 0.02 * comp_dt, water * 0.5);
-    let total_loss = min(shavings, absorb + gravity_sink);
-    shavings -= total_loss;
-    water += total_loss * 0.9;  // 90% becomes water, 10% volume loss (compression)
-    // Slush absorbs latent heat from water
-    T -= total_loss * params.latent_factor * 0.3;
+    let comp_dt = min(dt, 0.1);
+    let pore_fraction = max(1.0 - snow_density / 917.0, 0.0);
+    let percolation = min(water, shavings * pore_fraction * 0.01 * comp_dt);
+    if (percolation > 0.0) {
+      water -= percolation;
+      // Water absorbed into snow increases liquid water content
+      let snow_mass = shavings; // approximate mm of snow
+      snow_lwc = clamp(snow_lwc + percolation / max(snow_mass, 0.1), 0.0, 0.8);
+      // Warm water brings heat into snow layer
+      if (T > 0.0) {
+        let temp_factor = clamp(T * 0.2, 0.0, 1.0);
+        let melt_from_heat = min(percolation * temp_factor, shavings * 0.1);
+        shavings -= melt_from_heat;
+        water += melt_from_heat;
+        T -= melt_from_heat * params.latent_factor;
+      }
+    }
+  }
+
+  // --- Snow liquid water drainage ---
+  // Excess lwc above capillary retention (~3%) drains to surface water by gravity
+  if (shavings > 0.01 && snow_lwc > 0.03) {
+    let comp_dt = min(dt, 0.1);
+    let pore_fraction = max(1.0 - snow_density / 917.0, 0.0);
+    let excess_lwc = snow_lwc - 0.03;
+    let drain_rate = excess_lwc * pore_fraction * 0.05 * comp_dt;
+    let drained = drain_rate * shavings;
+    snow_lwc = max(snow_lwc - drain_rate, 0.03);
+    water += drained;
+  }
+
+  // --- Density-dependent slush formation ---
+  // When lwc > 0: density increases (snow grains collapse, water fills gaps)
+  if (shavings > 0.01 && snow_lwc > 0.0) {
+    let comp_dt = min(dt, 0.1);
+    let target_density = min(917.0, snow_density + snow_lwc * 200.0);
+    let density_rate = select(50.0, 150.0, snow_lwc > 0.15); // fast in slush regime
+    let d_density = min((target_density - snow_density) * density_rate * comp_dt / max(target_density, 1.0), target_density - snow_density);
+    if (d_density > 0.0) {
+      let old_density = snow_density;
+      snow_density += d_density;
+      // Volume conservation: snow depth decreases as density increases
+      let volume_ratio = old_density / max(snow_density, 1.0);
+      shavings *= volume_ratio;
+    }
+  }
+
+  // --- Slush freezing → snow-ice ---
+  // When T < 0 and lwc > 0: liquid in snow freezes, releasing latent heat
+  if (T < 0.0 && snow_lwc > 0.0 && shavings > 0.01) {
+    let comp_dt = min(dt, 0.1);
+    let freeze_amount = min(snow_lwc, params.freeze_rate * abs(T) * 2.0 / max(dt, 0.001) * comp_dt);
+    snow_lwc -= freeze_amount;
+    // Freezing water in snow increases density (with volume conservation)
+    let old_d = snow_density;
+    snow_density = min(917.0, snow_density + freeze_amount * 200.0);
+    if (snow_density > old_d) {
+      shavings *= old_d / snow_density;
+    }
+    // Latent heat release
+    let heat_released = freeze_amount * shavings * params.latent_factor * 0.2;
+    T += heat_released;
+  }
+
+  // --- Snow-ice → ice conversion ---
+  // Only converts when density is very close to pure ice (>900) AND well frozen (T < -2)
+  // This only realistically happens through the slush-freeze path, not dry sintering
+  if (shavings > 0.1 && snow_density > 900.0 && snow_lwc < 0.01 && T < -2.0) {
+    let ice_equivalent = shavings * (snow_density / 917.0);
+    ice += ice_equivalent;
+    // Transfer any mud from snow into ice (dirty ice)
+    // mud stays in state2 as a marker for dirty ice
+    shavings = 0.0;
+    snow_density = 0.0;
+    snow_lwc = 0.0;
+  }
+
+  // --- Natural compaction (gravity + sintering) ---
+  if (shavings > 0.01 && snow_density > 0.0) {
+    let comp_dt = min(dt, 0.1);
+    // Gravity compaction: target density depends on snow depth
+    let gravity_target = min(400.0, 200.0 + shavings * 2.0);
+    if (snow_density < gravity_target) {
+      let rate = 0.0001 * comp_dt;
+      let old_density = snow_density;
+      snow_density += (gravity_target - snow_density) * rate;
+      // Volume conservation
+      shavings *= old_density / max(snow_density, 1.0);
+    }
+    // Sintering at T < 0: ice crystal bonds form very slowly (days/weeks in reality)
+    if (T < 0.0 && snow_lwc < 0.02) {
+      let old_d_s = snow_density;
+      snow_density = min(600.0, snow_density + 0.01 * comp_dt);
+      // Volume conservation for sintering
+      if (snow_density > old_d_s) {
+        shavings *= old_d_s / snow_density;
+      }
+    }
+  }
+
+  // --- Snow-ice contact physics ---
+  // Snow sitting on ice doesn't just "float" — it interacts with the surface:
+  // Cold ice (T < -0.5): bottom of snow pack bonds to ice (freeze-bonding)
+  // Warm ice (T > -0.5): quasi-liquid layer on ice surface wets snow base
+  if (shavings > 0.01 && ice > 0.1) {
+    let comp_dt = min(dt, 0.1);
+    if (T < -0.5 && water < 0.01) {
+      // Freeze-bonding: snow base sinters onto ice surface
+      // Rate increases with colder temps and denser snow
+      let density_factor = clamp(snow_density / 400.0, 0.2, 1.0);
+      let bond_rate = 0.002 * abs(T + 0.5) * density_factor * comp_dt;
+      let bonded = min(shavings, bond_rate);
+      shavings -= bonded;
+      ice += bonded * clamp(snow_density / 917.0, 0.1, 1.0);
+      // If snow is exhausted, reset state2
+      if (shavings < 0.01) {
+        snow_density = 0.0;
+        snow_lwc = 0.0;
+      }
+    } else if (T > -0.5 && snow_lwc < 0.3) {
+      // Quasi-liquid layer: ice surface near 0°C has a thin melt film
+      // This wets the base of the snow pack, triggering slush formation path
+      let wetting_rate = 0.005 * (T + 0.5 + 0.5) * comp_dt; // stronger near 0°C
+      snow_lwc = min(snow_lwc + wetting_rate, 0.3);
+    }
+  }
+
+  // --- Mud advection with water flow ---
+  // Mud moves with water (simplified: follows water gravity flow direction)
+  if (mud > 0.001 && water > 0.01) {
+    var mud_delta = 0.0;
+    let mud_coupling = params.water_gravity_coupling * 0.5;
+    let my_surface = ice + water;
+    // Same 4-neighbor flow as water but for mud
+    if (is_passable_water(xl, y)) {
+      let ni = cell(xl, y);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = my_surface - n_surface;
+      if (h_diff > 0.0) {
+        mud_delta -= min(h_diff * 0.5 * mud_coupling, mud * 0.24);
+      }
+    }
+    if (is_passable_water(xr, y)) {
+      let ni = cell(xr, y);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = my_surface - n_surface;
+      if (h_diff > 0.0) {
+        mud_delta -= min(h_diff * 0.5 * mud_coupling, mud * 0.24);
+      }
+    }
+    if (is_passable_water(x, yu)) {
+      let ni = cell(x, yu);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = my_surface - n_surface;
+      if (h_diff > 0.0) {
+        mud_delta -= min(h_diff * 0.5 * mud_coupling, mud * 0.24);
+      }
+    }
+    if (is_passable_water(x, yd)) {
+      let ni = cell(x, yd);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = my_surface - n_surface;
+      if (h_diff > 0.0) {
+        mud_delta -= min(h_diff * 0.5 * mud_coupling, mud * 0.24);
+      }
+    }
+    // Receive mud from neighbors (flow toward us)
+    if (is_passable_water(xl, y)) {
+      let ni = cell(xl, y);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = n_surface - my_surface;
+      if (h_diff > 0.0) {
+        mud_delta += min(h_diff * 0.5 * mud_coupling, state2_in[ni].z * 0.24);
+      }
+    }
+    if (is_passable_water(xr, y)) {
+      let ni = cell(xr, y);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = n_surface - my_surface;
+      if (h_diff > 0.0) {
+        mud_delta += min(h_diff * 0.5 * mud_coupling, state2_in[ni].z * 0.24);
+      }
+    }
+    if (is_passable_water(x, yu)) {
+      let ni = cell(x, yu);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = n_surface - my_surface;
+      if (h_diff > 0.0) {
+        mud_delta += min(h_diff * 0.5 * mud_coupling, state2_in[ni].z * 0.24);
+      }
+    }
+    if (is_passable_water(x, yd)) {
+      let ni = cell(x, yd);
+      let n_surface = state_in[ni].y + state_in[ni].z;
+      let h_diff = n_surface - my_surface;
+      if (h_diff > 0.0) {
+        mud_delta += min(h_diff * 0.5 * mud_coupling, state2_in[ni].z * 0.24);
+      }
+    }
+    mud = max(mud + mud_delta, 0.0);
   }
 
   // --- Interactive tools (damage / water gun / snow gun) ---
@@ -435,14 +755,32 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
           ice -= damage;
           shavings += damage * 0.6;
           water += damage * 0.2;
+          // Shavings from ice damage are dense fragments
+          if (shavings > 0.01) {
+            snow_density = mix(snow_density, 400.0, damage * strength / max(shavings, 0.1));
+          }
         }
       } else if (params.damage_mode == 2u) {
         // Water gun: add warm water
         water += amt * strength;
         T = mix(T, params.damage_temp, 0.1 * strength);
       } else if (params.damage_mode == 3u) {
-        // Snow gun: add snow/shavings
-        shavings += amt * strength;
+        // Snow gun: add snow/shavings with fresh density
+        let added = amt * strength;
+        if (added > 0.0) {
+          let old_mass = shavings * snow_density;
+          let new_density = 80.0; // fresh snow
+          let new_mass = added * new_density;
+          shavings += added;
+          snow_density = (old_mass + new_mass) / max(shavings, 0.01);
+        }
+      } else if (params.damage_mode == 5u) {
+        // Mud gun: deposits mud + water mixture
+        let mud_add = amt * strength * 0.3; // 30% is mud
+        let water_add = amt * strength * 0.7; // 70% is water
+        mud += mud_add;
+        water += water_add;
+        T = mix(T, params.damage_temp, 0.05 * strength);
       }
     }
   }
@@ -592,4 +930,5 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   state_out[i] = vec4f(T, ice, water, shavings);
+  state2_out[i] = vec4f(snow_density, snow_lwc, mud, snow_reserved);
 }

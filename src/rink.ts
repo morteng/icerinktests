@@ -252,7 +252,7 @@ export function createPipeLayout(config: RinkConfig, mask: Float32Array): Float3
 }
 
 /**
- * Create initial state as vec4 per cell: (temperature, ice, water, reserved).
+ * Create initial state as vec4 per cell: (temperature, ice, water, shavings).
  * No water outside mask.
  */
 export function createInitialState(
@@ -270,6 +270,28 @@ export function createInitialState(
     data[i * 4 + 1] = inside ? iceMm : 0.0;
     data[i * 4 + 2] = inside ? waterMm : 0.0;
     data[i * 4 + 3] = 0.0;
+  }
+  return data;
+}
+
+/**
+ * Create initial state2 as vec4 per cell: (snow_density, snow_lwc, mud_amount, reserved).
+ * Cells with shavings (snow) get initial density; otherwise zero.
+ */
+export function createInitialState2(
+  config: RinkConfig,
+  state: Float32Array,
+): Float32Array {
+  const cellCount = config.gridW * config.gridH;
+  const data = new Float32Array(cellCount * 4);
+  // Default fresh snow density for outdoor: 80 kg/m³, indoor shavings: 400 kg/m³
+  const defaultDensity = config.isIndoor ? 400.0 : 80.0;
+  for (let i = 0; i < cellCount; i++) {
+    const shavings = state[i * 4 + 3];
+    data[i * 4 + 0] = shavings > 0.01 ? defaultDensity : 0.0; // snow_density
+    data[i * 4 + 1] = 0.0; // snow_lwc
+    data[i * 4 + 2] = 0.0; // mud_amount
+    data[i * 4 + 3] = 0.0; // reserved
   }
   return data;
 }

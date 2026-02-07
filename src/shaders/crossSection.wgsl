@@ -27,6 +27,8 @@ struct VSOut {
 @group(0) @binding(1) var<storage, read> state: array<vec4f>;
 @group(0) @binding(2) var<storage, read> pipes: array<f32>;
 @group(0) @binding(3) var<storage, read> markings: array<f32>;
+// State2: vec4f per cell (snow_density kg/m³, snow_lwc 0-1, mud_amount mm, reserved)
+@group(0) @binding(4) var<storage, read> state2: array<vec4f>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
@@ -179,25 +181,48 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     let shimmer = sin(across * 40.0 + depth * 200.0) * 0.05;
     color += vec3f(shimmer, shimmer, shimmer * 1.5);
   }
-  // === SNOW / SHAVINGS LAYER ===
+  // === SNOW / SHAVINGS LAYER (density/lwc-driven coloring) ===
   else if (depth < snow_top) {
     let noise = fract(sin(across * 127.1 + depth * 311.7) * 43758.5453);
     let noise2 = fract(sin(across * 269.3 + depth * 183.1) * 28461.7231);
-    if (params.is_outdoor > 0u) {
-      // Outdoor: fluffy snow look
-      color = mix(vec3f(0.85, 0.88, 0.92), vec3f(0.95, 0.97, 1.0), noise * 0.6);
-      if (noise2 > 0.92) {
-        color = vec3f(1.0, 1.0, 1.0);
-      }
+
+    // Read snow properties from state2
+    let s2 = state2[idx];
+    let density = max(s2.x, 50.0);   // kg/m³
+    let lwc = s2.y;                    // liquid water content
+    let mud_amt = s2.z;                // mud contamination
+
+    // Density-driven color: white(fresh,80) → gray(packed,400) → blue-gray(slush,600+) → white(snow-ice,850+)
+    let density_frac = clamp((density - 50.0) / (900.0 - 50.0), 0.0, 1.0);
+    var base_snow: vec3f;
+    if (density < 200.0) {
+      // Fresh snow: bright white
+      let t = clamp((density - 50.0) / 150.0, 0.0, 1.0);
+      base_snow = mix(vec3f(0.95, 0.97, 1.0), vec3f(0.88, 0.90, 0.92), t);
+    } else if (density < 500.0) {
+      // Packed snow: grayish
+      let t = clamp((density - 200.0) / 300.0, 0.0, 1.0);
+      base_snow = mix(vec3f(0.88, 0.90, 0.92), vec3f(0.70, 0.72, 0.78), t);
+    } else if (density < 800.0) {
+      // Slush: blue-gray
+      let t = clamp((density - 500.0) / 300.0, 0.0, 1.0);
+      base_snow = mix(vec3f(0.70, 0.72, 0.78), vec3f(0.55, 0.58, 0.68), t);
     } else {
-      // Indoor: ice shavings — speckled white/translucent chips
-      color = mix(vec3f(0.78, 0.82, 0.88), vec3f(0.92, 0.95, 0.98), noise);
-      // Sharper speckle pattern for chipped ice look
-      if (noise2 > 0.75) {
-        color = vec3f(0.96, 0.98, 1.0);
-      } else if (noise2 < 0.15) {
-        color = vec3f(0.65, 0.70, 0.78);
-      }
+      // Snow-ice: cloudy white-blue
+      base_snow = vec3f(0.78, 0.82, 0.90);
+    }
+
+    // Wet darkening from liquid water content
+    base_snow *= (1.0 - lwc * 0.3);
+
+    // Mud tinting: brown overlay
+    let mud_frac = clamp(mud_amt / 2.0, 0.0, 0.5);
+    base_snow = mix(base_snow, vec3f(0.45, 0.35, 0.20), mud_frac);
+
+    // Apply noise for texture
+    color = mix(base_snow * 0.92, base_snow, noise * 0.5);
+    if (noise2 > 0.92 && lwc < 0.05) {
+      color = min(base_snow * 1.1, vec3f(1.0));
     }
   }
 

@@ -75,3 +75,68 @@ export function createSolidsBuffer(config: RinkConfig, mask: Float32Array): Floa
 
   return solids;
 }
+
+/**
+ * Add fence/boards to solids buffer for backyard rink containment.
+ *   3.0 = fence post (blocks water AND snow, taller — 4x4 lumber)
+ *   4.0 = fence plank (blocks water AND snow — standard 2x6 or 2x8 lumber)
+ *
+ * Fence is 3 cells wide (inside boundary + 1 cell inward + 1 cell outward)
+ * for proper height-field mesh coverage. Posts at ~1.2m intervals.
+ */
+export function addFenceToSolids(
+  solids: Float32Array,
+  config: RinkConfig,
+  mask: Float32Array,
+): void {
+  const { gridW, gridH, cellSize } = config;
+
+  // Post spacing: ~1.2m in cells (standard fence post spacing)
+  const postSpacing = Math.max(Math.round(1.2 / cellSize), 6);
+
+  // Pass 1: find boundary cells (inside mask, adjacent to outside)
+  const isBoundary = new Uint8Array(gridW * gridH);
+  for (let y = 1; y < gridH - 1; y++) {
+    for (let x = 1; x < gridW - 1; x++) {
+      const idx = y * gridW + x;
+      if (mask[idx] < 0.5) continue;
+      const hasOutside =
+        mask[(y - 1) * gridW + x] < 0.5 ||
+        mask[(y + 1) * gridW + x] < 0.5 ||
+        mask[y * gridW + (x - 1)] < 0.5 ||
+        mask[y * gridW + (x + 1)] < 0.5;
+      if (hasOutside) {
+        isBoundary[idx] = 1;
+      }
+    }
+  }
+
+  // Pass 2: expand fence to 3 cells wide (boundary + 1 inward + 1 outward)
+  const fenceCells = new Set<number>();
+  for (let y = 1; y < gridH - 1; y++) {
+    for (let x = 1; x < gridW - 1; x++) {
+      const idx = y * gridW + x;
+      if (!isBoundary[idx]) continue;
+      // Mark this cell and neighbors (creates 3-cell-wide band)
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= gridW || ny < 0 || ny >= gridH) continue;
+          const ni = ny * gridW + nx;
+          if (solids[ni] > 0.5) continue; // don't overwrite goals
+          fenceCells.add(ni);
+        }
+      }
+    }
+  }
+
+  // Pass 3: assign post vs plank
+  for (const idx of fenceCells) {
+    const x = idx % gridW;
+    const y = Math.floor(idx / gridW);
+    // Posts at regular intervals (2-cell-wide posts for visibility)
+    const isPost = (x % postSpacing < 2 && y % postSpacing < 2);
+    solids[idx] = isPost ? 3.0 : 4.0;
+  }
+}

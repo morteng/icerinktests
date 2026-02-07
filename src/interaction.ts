@@ -1,6 +1,6 @@
 import { RinkConfig } from './rink';
 
-export type DamageType = 'none' | 'hockey' | 'water_gun' | 'snow_gun' | 'snowball_gun';
+export type DamageType = 'none' | 'hockey' | 'water_gun' | 'snow_gun' | 'snowball_gun' | 'mud_gun';
 
 export interface DamageParams {
   active: boolean;
@@ -35,6 +35,9 @@ export class InteractionManager {
 
   private _damageActive = false;
 
+  // Optional override for 3D mode ray casting
+  screenToGridOverride?: (e: MouseEvent) => { gx: number; gy: number };
+
   // Mouse velocity tracking
   private prevGridX = 0;
   private prevGridY = 0;
@@ -57,6 +60,7 @@ export class InteractionManager {
   }
 
   private screenToGrid(e: MouseEvent): { gx: number; gy: number } {
+    if (this.screenToGridOverride) return this.screenToGridOverride(e);
     const rect = this.canvas.getBoundingClientRect();
     const nx = (e.clientX - rect.left) / rect.width;
     const ny = (e.clientY - rect.top) / rect.height;
@@ -125,6 +129,9 @@ export class InteractionManager {
         break;
       case 'snowball_gun':
         mode = 4;    // snowball (handled by particles only)
+        break;
+      case 'mud_gun':
+        mode = 5;    // mud + water mixture
         break;
     }
     const active = this._damageActive && this.damageType !== 'none';

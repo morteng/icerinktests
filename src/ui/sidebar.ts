@@ -1,6 +1,7 @@
 import { MarkingLayout } from '../markings';
 import { GroundType, RinkConfig } from '../rink';
 import { SimTunables } from '../simulation';
+import { CameraPreset } from '../camera';
 import {
   createSlider, createSelect, createCheckbox, createButton,
   createColorInput, createTextInput, createButtonRow,
@@ -9,7 +10,7 @@ import {
 import { MenuTab } from './menuBar';
 
 export type PaintMode = 'off' | 'red' | 'blue' | 'white' | 'erase';
-export type ActiveTool = 'none' | 'skate' | 'water' | 'snow' | 'snowball';
+export type ActiveTool = 'none' | 'skate' | 'water' | 'snow' | 'snowball' | 'mud';
 
 export interface ToolSliderState {
   radius: number;
@@ -49,6 +50,10 @@ export class Sidebar {
   onLightResetAuto: (() => void) | null = null;
   onTimeManual: (() => void) | null = null;
   onPrep: (() => void) | null = null;
+  onCameraPreset: ((preset: CameraPreset) => void) | null = null;
+  onCameraOrthoToggle: ((ortho: boolean) => void) | null = null;
+  onFenceToggle: ((enabled: boolean) => void) | null = null;
+  onSpriteViewer: (() => void) | null = null;
 
   // --- Controls (assigned in build* methods called from constructor) ---
   // Scene section
@@ -58,6 +63,8 @@ export class Sidebar {
   private groundCtrl!: HTMLDivElement;
   private surfaceSelect!: HTMLSelectElement;
   private surfaceCtrl!: HTMLDivElement;
+  private fenceCheckbox!: HTMLInputElement;
+  private fenceCtrl!: HTMLDivElement;
   private customLength!: SliderResult;
   private customWidth!: SliderResult;
   private customCorner!: SliderResult;
@@ -76,10 +83,14 @@ export class Sidebar {
 
   // Rendering section
   private viewModeSelect!: HTMLSelectElement;
+  private cameraPanel!: HTMLDivElement;
+  private orthoCheckbox!: HTMLInputElement;
   private showPipesCheckbox!: HTMLInputElement;
   private showPipesCtrl!: HTMLDivElement;
   private showMarkingsCheckbox!: HTMLInputElement;
   private markingLayoutSelect!: HTMLSelectElement;
+  private skyModeSelect!: HTMLSelectElement;
+  private skyModeCtrl!: HTMLDivElement;
 
   // Lights (in rendering section)
   private lightBtn!: HTMLButtonElement;
@@ -113,6 +124,10 @@ export class Sidebar {
   private snowballRate!: SliderResult;
   private snowballSize!: SliderResult;
   private snowballPressure!: SliderResult;
+  private mudBtn!: HTMLButtonElement;
+  private mudPanel!: HTMLDivElement;
+  private mudRadius!: SliderResult;
+  private mudFlow!: SliderResult;
 
   // Paint (in tools section)
   private paintSelect!: HTMLSelectElement;
@@ -138,6 +153,9 @@ export class Sidebar {
   private drainSlider!: SliderResult;
   private snowReposeSlider!: SliderResult;
   private snowTransferSlider!: SliderResult;
+
+  // Exposure
+  private exposureSlider!: SliderResult;
 
   // Render flags
   private shadowsCheckbox!: HTMLInputElement;
@@ -275,6 +293,13 @@ export class Sidebar {
     this.surfaceCtrl.classList.add('hidden');
     section.appendChild(this.surfaceCtrl);
 
+    // Fence toggle (backyard only, hidden by default)
+    const fence = createCheckbox('Fence / Boards', true);
+    this.fenceCheckbox = fence.checkbox;
+    this.fenceCtrl = fence.row;
+    this.fenceCtrl.classList.add('hidden');
+    section.appendChild(this.fenceCtrl);
+
     // Custom sliders (hidden by default)
     this.customControls = document.createElement('div');
     this.customControls.className = 'custom-sliders';
@@ -296,6 +321,9 @@ export class Sidebar {
     });
     this.surfaceSelect.addEventListener('change', () => {
       this.onSurfaceGroundTypeChange?.(this.surfaceSelect.value as GroundType);
+    });
+    this.fenceCheckbox.addEventListener('change', () => {
+      this.onFenceToggle?.(this.fenceCheckbox.checked);
     });
     const customChange = () => {
       if (this.presetSelect.value === 'custom') this.firePresetChange();
@@ -380,12 +408,59 @@ export class Sidebar {
       label: 'View',
       options: [
         { value: 'thermal', text: 'Thermal' },
-        { value: 'visual', text: 'Visual', selected: true },
+        { value: 'visual', text: 'Visual' },
         { value: 'sky', text: 'Sky' },
+        { value: 'isometric', text: 'Isometric', selected: true },
       ],
     });
     this.viewModeSelect = viewMode.select;
     section.appendChild(viewMode.row);
+
+    // Camera controls (visible only in isometric/3D mode)
+    this.cameraPanel = document.createElement('div');
+    this.cameraPanel.className = 'tool-panel';
+
+    const ortho = createCheckbox('Orthographic', true);
+    this.orthoCheckbox = ortho.checkbox;
+    this.cameraPanel.appendChild(ortho.row);
+
+    const obliqueBtn = createButton('Oblique');
+    const topBtn = createButton('Top');
+    const frontBtn = createButton('Front');
+    const sideBtn = createButton('Side');
+    const cornerBtn = createButton('Corner');
+    const tvBtn = createButton('TV');
+    this.cameraPanel.appendChild(createButtonRow(obliqueBtn, topBtn, frontBtn, sideBtn, cornerBtn, tvBtn));
+
+    section.appendChild(this.cameraPanel);
+
+    // Wire camera events
+    this.orthoCheckbox.addEventListener('change', () => {
+      this.onCameraOrthoToggle?.(this.orthoCheckbox.checked);
+    });
+    const presetClick = (preset: CameraPreset) => () => this.onCameraPreset?.(preset);
+    obliqueBtn.addEventListener('click', presetClick('oblique'));
+    topBtn.addEventListener('click', presetClick('top'));
+    frontBtn.addEventListener('click', presetClick('front'));
+    sideBtn.addEventListener('click', presetClick('side'));
+    cornerBtn.addEventListener('click', presetClick('corner'));
+    tvBtn.addEventListener('click', presetClick('tv'));
+
+    // Sky mode (visible only in isometric/3D mode)
+    const skyMode = createSelect({
+      label: 'Sky',
+      options: [
+        { value: 'physical', text: 'Physical', selected: true },
+        { value: 'skybox', text: 'Skybox (HDRI)' },
+      ],
+    });
+    this.skyModeSelect = skyMode.select;
+    this.skyModeCtrl = skyMode.row;
+    section.appendChild(this.skyModeCtrl);
+
+    // Exposure slider
+    this.exposureSlider = createSlider({ label: 'Exposure', min: -3, max: 3, value: 0, step: 0.1, short: true, formatVal: v => v === 0 ? '0' : (v > 0 ? `+${v.toFixed(1)}` : v.toFixed(1)) });
+    section.appendChild(this.exposureSlider.row);
 
     // Overlays sub-group
     section.appendChild(createSubGroup('Overlays'));
@@ -467,6 +542,12 @@ export class Sidebar {
     this.thinFilmCheckbox = thinFilm.checkbox;
     section.appendChild(thinFilm.row);
 
+    // Debug sub-group
+    section.appendChild(createSubGroup('Debug'));
+    const spriteViewerBtn = createButton('Sprite Atlas');
+    section.appendChild(createButtonRow(spriteViewerBtn));
+    spriteViewerBtn.addEventListener('click', () => this.onSpriteViewer?.());
+
     this.el.appendChild(section);
 
     // Events
@@ -474,7 +555,13 @@ export class Sidebar {
       if (this.renderMode === 1) {
         this.showMarkingsCheckbox.checked = true;
       }
+      const is3d = this.renderMode === 3;
+      this.cameraPanel.style.display = is3d ? '' : 'none';
+      this.skyModeCtrl.style.display = is3d ? '' : 'none';
     });
+    // Initial visibility
+    this.cameraPanel.style.display = this.renderMode === 3 ? '' : 'none';
+    this.skyModeCtrl.style.display = this.renderMode === 3 ? '' : 'none';
     this.markingLayoutSelect.addEventListener('change', () => {
       this.onMarkingLayoutChange?.(this.markingLayoutSelect.value as MarkingLayout);
     });
@@ -517,7 +604,9 @@ export class Sidebar {
     this.waterBtn = createButton('Water');
     this.snowBtn = createButton('Snow');
     this.snowballBtn = createButton('Snowball');
+    this.mudBtn = createButton('Mud');
     section.appendChild(createButtonRow(this.skateBtn, this.waterBtn, this.snowBtn, this.snowballBtn));
+    section.appendChild(createButtonRow(this.mudBtn));
 
     // Skate sub-panel
     this.skatePanel = document.createElement('div');
@@ -554,6 +643,14 @@ export class Sidebar {
     this.snowballPressure = createSlider({ label: 'Pressure', min: 1, max: 8, value: 5, step: 0.5, short: true, formatVal: v => v.toFixed(1) });
     this.snowballPanel.append(this.snowballRate.row, this.snowballSize.row, this.snowballPressure.row);
     section.appendChild(this.snowballPanel);
+
+    // Mud sub-panel
+    this.mudPanel = document.createElement('div');
+    this.mudPanel.className = 'tool-panel hidden';
+    this.mudRadius = createSlider({ label: 'Radius', min: 1, max: 12, value: 6, step: 1, short: true });
+    this.mudFlow = createSlider({ label: 'Flow', min: 0.1, max: 3.0, value: 1.0, step: 0.1, short: true, formatVal: v => v.toFixed(1) });
+    this.mudPanel.append(this.mudRadius.row, this.mudFlow.row);
+    section.appendChild(this.mudPanel);
 
     // Paint sub-group
     section.appendChild(createSubGroup('Paint'));
@@ -603,6 +700,7 @@ export class Sidebar {
     this.waterBtn.addEventListener('click', () => this.activateTool('water'));
     this.snowBtn.addEventListener('click', () => this.activateTool('snow'));
     this.snowballBtn.addEventListener('click', () => this.activateTool('snowball'));
+    this.mudBtn.addEventListener('click', () => this.activateTool('mud'));
 
     // Events — paint
     this.paintSelect.addEventListener('change', () => {
@@ -632,7 +730,7 @@ export class Sidebar {
     this.airTauSlider = createSlider({ label: 'Air Tau', min: 500, max: 100000, value: 10000, step: 500, short: true, formatVal: v => `${Math.round(v)}s` });
     this.evapSlider = createSlider({ label: 'Evap', min: 0, max: 0.001, value: 0.0001, step: 0.00001, short: true, formatVal: v => v.toFixed(5) });
     this.drainSlider = createSlider({ label: 'Drain', min: 0, max: 0.2, value: 0.05, step: 0.005, short: true, formatVal: v => v.toFixed(3) });
-    this.snowReposeSlider = createSlider({ label: 'Snow Angle', min: 0.5, max: 5, value: 1.5, step: 0.1, short: true, formatVal: v => `${v.toFixed(1)}mm` });
+    this.snowReposeSlider = createSlider({ label: 'Snow Angle', min: 5, max: 120, value: 40, step: 1, short: true, formatVal: v => `${v.toFixed(0)}mm` });
     this.snowTransferSlider = createSlider({ label: 'Snow Slide', min: 0.05, max: 0.8, value: 0.3, step: 0.01, short: true, formatVal: v => v.toFixed(2) });
 
     section.append(
@@ -712,6 +810,9 @@ export class Sidebar {
     } else if (tool === 'snowball') {
       this.snowballBtn.classList.add('active');
       this.snowballPanel.classList.remove('hidden');
+    } else if (tool === 'mud') {
+      this.mudBtn.classList.add('active');
+      this.mudPanel.classList.remove('hidden');
     }
   }
 
@@ -721,10 +822,12 @@ export class Sidebar {
     this.waterBtn.classList.remove('active');
     this.snowBtn.classList.remove('active');
     this.snowballBtn.classList.remove('active');
+    this.mudBtn.classList.remove('active');
     this.skatePanel.classList.add('hidden');
     this.waterPanel.classList.add('hidden');
     this.snowPanel.classList.add('hidden');
     this.snowballPanel.classList.add('hidden');
+    this.mudPanel.classList.add('hidden');
   }
 
   private deactivateLightTool() {
@@ -741,7 +844,10 @@ export class Sidebar {
   get preset(): string { return this.presetSelect.value; }
   get renderMode(): number {
     const v = this.viewModeSelect.value;
-    return v === 'visual' ? 1 : v === 'sky' ? 2 : 0;
+    if (v === 'visual') return 1;
+    if (v === 'sky') return 2;
+    if (v === 'isometric') return 3;
+    return 0; // thermal
   }
   get ambientTemp(): number { return parseFloat(this.ambientSlider.slider.value); }
   get pipeTemp(): number { return parseFloat(this.pipeSlider.slider.value); }
@@ -761,6 +867,8 @@ export class Sidebar {
   get cloudCoverManual(): number { return parseFloat(this.cloudSlider.slider.value); }
   get precipMode(): string { return this.precipSelect.value; }
   get precipIntensityVal(): number { return parseFloat(this.precipIntensity.slider.value); }
+  get skyMode(): 'physical' | 'skybox' { return this.skyModeSelect.value as 'physical' | 'skybox'; }
+  get fenceEnabled(): boolean { return this.fenceCheckbox.checked; }
 
   get simTunables(): SimTunables {
     return {
@@ -773,6 +881,11 @@ export class Sidebar {
       snowRepose: parseFloat(this.snowReposeSlider.slider.value),
       snowTransfer: parseFloat(this.snowTransferSlider.slider.value),
     };
+  }
+
+  /** Exposure as linear multiplier (2^EV from slider) */
+  get exposure(): number {
+    return Math.pow(2, parseFloat(this.exposureSlider.slider.value));
   }
 
   get renderFlags(): number {
@@ -814,6 +927,12 @@ export class Sidebar {
         temp: -5, pressure: parseFloat(this.snowballPressure.slider.value),
         spread: parseFloat(this.snowballRate.slider.value),
       };
+    } else if (this._activeTool === 'mud') {
+      return {
+        radius: parseInt(this.mudRadius.slider.value),
+        amount: parseFloat(this.mudFlow.slider.value),
+        temp: 10, pressure: 0, spread: 0,
+      };
     }
     return { radius: 5, amount: 0.8, temp: 20, pressure: 5, spread: 5 };
   }
@@ -847,6 +966,7 @@ export class Sidebar {
     this.customControls.classList.toggle('show', config.preset === 'custom');
     this.groundCtrl.classList.toggle('hidden', !config.isBackyard);
     this.surfaceCtrl.classList.toggle('hidden', !config.isBackyard);
+    this.fenceCtrl.classList.toggle('hidden', !config.isBackyard);
     this.weatherControls.style.display = config.isIndoor ? 'none' : '';
 
     if (config.isBackyard) {
@@ -865,6 +985,14 @@ export class Sidebar {
 
   setAmbientTemp(v: number) { this.ambientSlider.setVal(v); }
   setPipeTemp(v: number) { this.pipeSlider.setVal(v); }
+
+  /** Programmatic toggle of pause state (used by debug API). */
+  togglePause() {
+    this._paused = !this._paused;
+    this.pauseBtn.textContent = this._paused ? 'Play' : 'Pause';
+    this.pauseBtn.classList.toggle('active', this._paused);
+    this.onPauseToggle?.();
+  }
 
   setWindDisplay(speedMs: number, dirDeg: number) {
     const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];

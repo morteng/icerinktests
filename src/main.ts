@@ -8,6 +8,9 @@ import { Sidebar } from './ui/sidebar';
 import { MenuBar } from './ui/menuBar';
 import { StatsBar } from './ui/statsBar';
 import { CrossSectionUI } from './ui/crossSectionUI';
+import { IceDebug } from './debug';
+import { SpriteViewer } from './ui/spriteViewer';
+import { getOrCreateAtlas } from './spriteSheet';
 
 const CS_PANEL_WIDTH = 160;
 const SIDEBAR_WIDTH = 220;
@@ -39,6 +42,9 @@ async function main() {
     console.error('GPU device lost:', info.message);
     errorEl.textContent = `GPU device lost: ${info.message}`;
     errorEl.style.display = 'block';
+  });
+  device.addEventListener('uncapturederror', (e: any) => {
+    console.error('WebGPU error:', e.error?.message ?? e.error);
   });
 
   // --- Canvases ---
@@ -99,8 +105,6 @@ async function main() {
   function resize() {
     const s = scene();
     if (!s) return;
-    canvas.width = s.config.gridW;
-    canvas.height = s.config.gridH;
 
     const rinkAspect = s.config.gridW / s.config.gridH;
     const maxW = window.innerWidth - CS_PANEL_WIDTH - SIDEBAR_WIDTH;
@@ -114,7 +118,18 @@ async function main() {
     canvas.style.width = `${Math.floor(w)}px`;
     canvas.style.height = `${Math.floor(h)}px`;
 
+    // Canvas pixel dimensions depend on render mode
     const dpr = window.devicePixelRatio || 1;
+    if (sidebar.renderMode === 3) {
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      canvas.style.imageRendering = 'auto';
+    } else {
+      canvas.width = s.config.gridW;
+      canvas.height = s.config.gridH;
+      canvas.style.imageRendering = 'pixelated';
+    }
+
     const csW = CS_PANEL_WIDTH;
     const csH = Math.floor(h);
     csCanvas.width = Math.floor(csW * dpr);
@@ -128,6 +143,10 @@ async function main() {
     sceneManager.createScene(preset, currentLayout, sidebar.ambientTemp, customDims, groundType, surfaceGroundType);
     const s = scene();
     s.scheduler.autoMode = sidebar.autoMode;
+    // Auto-enable fence for backyard presets if checkbox is checked
+    if (s.config.isBackyard && sidebar.fenceEnabled) {
+      s.toggleFence(true);
+    }
     cursorGridX = Math.floor(s.config.gridW / 2);
     cursorGridY = Math.floor(s.config.gridH / 2);
     csUI.updateConfig(s.config);
@@ -138,6 +157,22 @@ async function main() {
 
   // --- Initial build ---
   rebuildScene('backyard_small');
+
+  // --- Debug Console API ---
+  const iceDebug = new IceDebug(sceneManager, canvas, {
+    setAmbient: (t) => sidebar.setAmbientTemp(t),
+    togglePause: () => sidebar.togglePause(),
+    triggerFlood: () => { scene().pendingFlood = 3.0; },
+    triggerZamboni: () => { scene().switchMachine('zamboni'); scene().zamboni.start(); },
+    triggerShovel: () => { scene().switchMachine('shovel'); scene().zamboni.start(); },
+    addSnow: (mm) => { scene().pendingSnow = mm; },
+  });
+  (window as any).iceDebug = iceDebug;
+
+  // --- Sprite Viewer ---
+  const spriteViewer = new SpriteViewer(getOrCreateAtlas);
+  document.body.appendChild(spriteViewer.el);
+  sidebar.onSpriteViewer = () => spriteViewer.toggle();
 
   // --- Sidebar callbacks ---
   sidebar.onPresetChange = (preset, customDims) => {
@@ -166,6 +201,7 @@ async function main() {
     rebuildScene(s.config.preset, undefined, sidebar.groundType, surfaceGroundType);
   };
 
+  sidebar.onFenceToggle = (enabled) => { scene().toggleFence(enabled); };
   sidebar.onReset = () => scene().reset(sidebar.ambientTemp);
   sidebar.onPrep = () => scene().prep();
   sidebar.onFlood = () => { scene().pendingFlood = 3.0; };
@@ -277,12 +313,32 @@ async function main() {
     sel.b = parseInt(hex.slice(5, 7), 16) / 255;
   };
 
+  sidebar.onCameraPreset = (preset) => {
+    scene().isoRenderer.camera.setPreset(preset);
+  };
+  sidebar.onCameraOrthoToggle = (ortho) => {
+    scene().isoRenderer.camera.ortho = ortho;
+  };
+
   sidebar.refreshSaveList(sceneManager.listSaved());
 
   // --- Canvas helper ---
   function canvasToGrid(e: MouseEvent): [number, number] {
     const rect = canvas.getBoundingClientRect();
     const s = scene();
+    if (sidebar.renderMode === 3) {
+      // 3D mode: ray cast through camera to ground plane
+      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+      const hit = s.isoRenderer.camera.screenToGrid(ndcX, ndcY);
+      if (hit) {
+        return [
+          Math.max(0, Math.min(Math.floor(hit[0]), s.config.gridW - 1)),
+          Math.max(0, Math.min(Math.floor(hit[1]), s.config.gridH - 1)),
+        ];
+      }
+      return [cursorGridX, cursorGridY];
+    }
     const nx = (e.clientX - rect.left) / rect.width;
     const ny = (e.clientY - rect.top) / rect.height;
     return [
@@ -356,6 +412,75 @@ async function main() {
     lightDragging = false;
   });
 
+  // --- Camera controls for 3D view ---
+  // Alt+drag = orbit, Shift+drag or right-drag = pan, scroll = zoom
+  let cameraMouseDown = false;
+  let cameraPanMode = false;
+  let lastCameraX = 0;
+  let lastCameraY = 0;
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (sidebar.renderMode !== 3) return;
+    const cam = scene().isoRenderer.camera;
+    if (cam.locked) {
+      // Locked camera: any left-click drag = pan
+      if (e.button === 0 || e.button === 2) {
+        cameraPanMode = true;
+        cameraMouseDown = true;
+        lastCameraX = e.clientX;
+        lastCameraY = e.clientY;
+        e.preventDefault();
+      }
+    } else if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
+      // Right-click or Shift+left = pan
+      cameraPanMode = true;
+      cameraMouseDown = true;
+      lastCameraX = e.clientX;
+      lastCameraY = e.clientY;
+      e.preventDefault();
+    } else if (e.button === 0 && e.altKey) {
+      // Alt+left = orbit
+      cameraMouseDown = true;
+      cameraPanMode = false;
+      lastCameraX = e.clientX;
+      lastCameraY = e.clientY;
+      e.preventDefault();
+    }
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (!cameraMouseDown || sidebar.renderMode !== 3) return;
+    const dx = e.clientX - lastCameraX;
+    const dy = e.clientY - lastCameraY;
+    lastCameraX = e.clientX;
+    lastCameraY = e.clientY;
+
+    const s = scene();
+    if (cameraPanMode) {
+      s.isoRenderer.camera.pan(-dx * 0.5, -dy * 0.5);
+    } else {
+      s.isoRenderer.camera.orbit(-dx * 0.01, -dy * 0.01);
+    }
+  });
+
+  canvas.addEventListener('mouseup', (e) => {
+    if (e.button === 0 || e.button === 2) {
+      cameraMouseDown = false;
+      cameraPanMode = false;
+    }
+  });
+
+  canvas.addEventListener('wheel', (e) => {
+    if (sidebar.renderMode !== 3) return;
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.1 : -0.1;
+    scene().isoRenderer.camera.zoom(delta);
+  }, { passive: false });
+
+  canvas.addEventListener('contextmenu', (e) => {
+    if (sidebar.renderMode === 3) e.preventDefault();
+  });
+
   // --- FPS ---
   function updateFps(now: number) {
     fpsTimes.push(now);
@@ -374,6 +499,25 @@ async function main() {
     const s = scene();
     updateFps(now);
 
+    // Set 3D ray-cast override for interaction manager
+    if (sidebar.renderMode === 3) {
+      s.interaction.screenToGridOverride = (e: MouseEvent) => {
+        const rect = canvas.getBoundingClientRect();
+        const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const ndcY = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+        const hit = s.isoRenderer.camera.screenToGrid(ndcX, ndcY);
+        if (hit) {
+          return {
+            gx: Math.max(0, Math.min(Math.floor(hit[0]), s.config.gridW - 1)),
+            gy: Math.max(0, Math.min(Math.floor(hit[1]), s.config.gridH - 1)),
+          };
+        }
+        return { gx: cursorGridX, gy: cursorGridY };
+      };
+    } else {
+      s.interaction.screenToGridOverride = undefined;
+    }
+
     // Sync tool settings from sidebar to interaction
     const ts = sidebar.toolSliders;
     s.interaction.toolSettings.radius = ts.radius;
@@ -384,7 +528,7 @@ async function main() {
 
     // Sync damage type from sidebar to interaction
     const tool = sidebar.activeTool;
-    s.interaction.damageType = tool === 'skate' ? 'hockey' : tool === 'water' ? 'water_gun' : tool === 'snow' ? 'snow_gun' : tool === 'snowball' ? 'snowball_gun' : 'none';
+    s.interaction.damageType = tool === 'skate' ? 'hockey' : tool === 'water' ? 'water_gun' : tool === 'snow' ? 'snow_gun' : tool === 'snowball' ? 'snowball_gun' : tool === 'mud' ? 'mud_gun' : 'none';
 
     // Sync machine sliders to zamboni
     if (s.zamboni.active) {
@@ -400,10 +544,11 @@ async function main() {
 
     let ambientTemp = sidebar.ambientTemp;
     const paused = sidebar.paused;
-    const simSecsPerFrame = s.zamboni.active ? (1 / 60) : sidebar.simSpeed;
+    const realtime = s.zamboni.active || s.skaterSim.count > 0;
+    const simSecsPerFrame = realtime ? (1 / 60) : sidebar.simSpeed;
 
     // Speed display
-    sidebar.setSpeedDisplay(s.zamboni.active);
+    sidebar.setSpeedDisplay(realtime);
 
     // Auto mode sync
     s.scheduler.autoMode = sidebar.autoMode;
@@ -438,7 +583,7 @@ async function main() {
       lightToolActive: sidebar.lightToolActive,
       selectedLight: s.lightingMgr.selectedIndex,
       paintMode: sidebar.paintMode,
-      damageType: tool === 'skate' ? 'hockey' : tool === 'water' ? 'water_gun' : tool === 'snow' ? 'snow_gun' : tool === 'snowball' ? 'snowball_gun' : 'none',
+      damageType: tool === 'skate' ? 'hockey' : tool === 'water' ? 'water_gun' : tool === 'snow' ? 'snow_gun' : tool === 'snowball' ? 'snowball_gun' : tool === 'mud' ? 'mud_gun' : 'none',
       autoMode: s.scheduler.autoMode,
       paused,
       weatherAuto: sidebar.weatherAuto,
@@ -447,6 +592,8 @@ async function main() {
       precipIntensity: sidebar.precipIntensityVal,
       simTunables: sidebar.simTunables,
       renderFlags: sidebar.renderFlags,
+      exposure: sidebar.exposure,
+      skyMode: sidebar.skyMode,
     };
 
     const { timeOfDay } = s.update(inputs);
@@ -469,10 +616,36 @@ async function main() {
     // Coolant display
     statsBar.updateCoolantDisplay(s.config.hasPipes, sidebar.pipeTemp);
 
+    // --- Ensure canvas resolution matches render mode ---
+    if (sidebar.renderMode === 3) {
+      // 3D: full display resolution, smooth scaling
+      const dpr = window.devicePixelRatio || 1;
+      const rinkAspect = s.config.gridW / s.config.gridH;
+      const maxW = window.innerWidth - CS_PANEL_WIDTH - SIDEBAR_WIDTH;
+      const maxH = window.innerHeight - 80 - 34;
+      let cssW = maxW;
+      let cssH = cssW / rinkAspect;
+      if (cssH > maxH) { cssH = maxH; cssW = cssH * rinkAspect; }
+      const targetW = Math.floor(cssW * dpr);
+      const targetH = Math.floor(cssH * dpr);
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+        canvas.style.imageRendering = 'auto';
+      }
+    } else {
+      // 2D: 1px = 1 cell (Noita-style), pixelated scaling
+      if (canvas.width !== s.config.gridW || canvas.height !== s.config.gridH) {
+        canvas.width = s.config.gridW;
+        canvas.height = s.config.gridH;
+        canvas.style.imageRendering = 'pixelated';
+      }
+    }
+
     // --- Render ---
     const textureView = ctx.getCurrentTexture().createView();
     const csTextureView = csCtx.getCurrentTexture().createView();
-    s.render(textureView, csTextureView, csCanvas.width, csCanvas.height);
+    s.render(textureView, csTextureView, csCanvas.width, csCanvas.height, canvas.width, canvas.height);
 
     // --- Sim time & stats ---
     statsBar.updateSimTime(s.simTime);

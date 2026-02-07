@@ -51,6 +51,10 @@ export interface RenderOptions {
   moonDir: [number, number, number];
   moonPhase: number;
   renderFlags: number;
+  exposure?: number;
+  skyMode?: string;  // 'physical' | 'skybox'
+  groundType?: number;  // surface ground: 0=concrete, 1=grass, 2=gravel, 3=asphalt
+  surroundGroundType?: number;  // surround ground type
 }
 
 export class Renderer {
@@ -106,6 +110,7 @@ export class Renderer {
 
     const bgl = this.pipeline.getBindGroupLayout(0);
     const [bufA, bufB] = simulation.temperatureBuffers;
+    const [s2A, s2B] = simulation.state2BufferPair;
     const pipeBuffer = simulation.pipeLayoutBuffer;
 
     this.bindGroups = [
@@ -120,6 +125,7 @@ export class Renderer {
           { binding: 5, resource: { buffer: this.spriteBuffer } },
           { binding: 6, resource: { buffer: scratchBuffer } },
           { binding: 7, resource: { buffer: this.particleBuffer } },
+          { binding: 8, resource: { buffer: s2A } },
         ],
       }),
       device.createBindGroup({
@@ -133,6 +139,7 @@ export class Renderer {
           { binding: 5, resource: { buffer: this.spriteBuffer } },
           { binding: 6, resource: { buffer: scratchBuffer } },
           { binding: 7, resource: { buffer: this.particleBuffer } },
+          { binding: 8, resource: { buffer: s2B } },
         ],
       }),
     ];

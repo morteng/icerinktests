@@ -11,9 +11,17 @@ interface Skater {
   vx: number;
   vy: number;
   dir: number;      // facing angle (radians)
+  speed: number;    // desired speed (m/s)
   type: number;      // 0=hockey, 1=figure, 2=public
   team: number;      // 0=home, 1=away (hockey only)
   active: boolean;
+  phase: number;     // animation phase (0-1 cycling) for leg/arm stride
+  seed: number;      // random seed (0-1) for appearance variation (color, height)
+  heightScale: number; // billboard height multiplier (0.85-1.15)
+  // Steering target
+  targetX: number;
+  targetY: number;
+  stuckTimer: number; // time since last significant movement
   // Figure skating: arc parameters
   arcCenter?: { x: number; y: number };
   arcRadius?: number;
@@ -26,6 +34,15 @@ const TYPE_TO_SPRITE: SpriteType[] = [
   SpriteType.SKATER_FIGURE,
   SpriteType.SKATER_PUBLIC,
 ];
+
+// Separation distance in cells
+const SEPARATION_DIST = 8;
+const SEPARATION_FORCE = 3.0;
+// Wall avoidance: start steering away when this many cells from boundary
+const WALL_SENSE_DIST = 6;
+const WALL_FORCE = 5.0;
+// Steering smoothness (higher = snappier turns)
+const STEER_RATE = 3.0;
 
 export class SkaterSimulation {
   private config: RinkConfig;
@@ -81,6 +98,29 @@ export class SkaterSimulation {
     return { x: (b.left + b.right) / 2, y: (b.top + b.bottom) / 2 };
   }
 
+  /** Pick a new random target within the rink, biased toward open areas. */
+  private pickTarget(sk: Skater): { x: number; y: number } {
+    // Try a few times to find a passable target that's reasonably far away
+    for (let i = 0; i < 10; i++) {
+      const pos = this.randomInsidePos();
+      const dx = pos.x - sk.x;
+      const dy = pos.y - sk.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > 20) return pos; // At least 20 cells away
+    }
+    return this.randomInsidePos();
+  }
+
+  /** Compute distance to nearest non-passable cell along a direction. */
+  private wallDistance(x: number, y: number, dx: number, dy: number): number {
+    for (let step = 1; step <= WALL_SENSE_DIST; step++) {
+      if (!this.isPassable(x + dx * step, y + dy * step)) {
+        return step;
+      }
+    }
+    return WALL_SENSE_DIST + 1;
+  }
+
   spawn(type: SkaterType, count: number) {
     const typeNum = type === 'hockey' ? 0 : type === 'figure' ? 1 : 2;
 
@@ -91,15 +131,29 @@ export class SkaterSimulation {
                     type === 'figure' ? 2.0 + Math.random() * 1.5 :
                     1.5 + Math.random() * 2.0;
 
+      const seed = Math.random();
+      const variedSpeed = speed * (0.8 + seed * 0.4);
+
       const skater: Skater = {
         x: pos.x, y: pos.y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
+        vx: Math.cos(angle) * variedSpeed,
+        vy: Math.sin(angle) * variedSpeed,
         dir: angle,
+        speed: variedSpeed,
         type: typeNum,
-        team: i % 2, // alternate teams
+        team: i % 2,
         active: true,
+        phase: Math.random(),
+        seed,
+        heightScale: 0.85 + seed * 0.30,
+        targetX: 0, targetY: 0,
+        stuckTimer: 0,
       };
+
+      // Set initial target
+      const target = this.pickTarget(skater);
+      skater.targetX = target.x;
+      skater.targetY = target.y;
 
       // Figure skaters: set up arc path
       if (type === 'figure') {
@@ -126,23 +180,31 @@ export class SkaterSimulation {
 
   update(dt: number) {
     const cellsPerM = 1 / this.config.cellSize;
+    const active = this.skaters.filter(s => s.active);
 
-    for (const sk of this.skaters) {
-      if (!sk.active) continue;
+    for (const sk of active) {
+      // Cycle animation phase proportional to movement speed
+      const spd = Math.sqrt(sk.vx * sk.vx + sk.vy * sk.vy);
+      sk.phase = (sk.phase + spd * dt * 0.5) % 1.0;
 
       if (sk.type === 1 && sk.arcCenter && sk.arcRadius && sk.arcSpeed) {
-        // Figure skater: follow arc path
+        // Figure skater: follow arc path with separation
         const angle = Math.atan2(sk.y - sk.arcCenter.y, sk.x - sk.arcCenter.x);
         const newAngle = angle + sk.arcSpeed * dt;
-        const nx = sk.arcCenter.x + Math.cos(newAngle) * sk.arcRadius;
-        const ny = sk.arcCenter.y + Math.sin(newAngle) * sk.arcRadius;
+        let nx = sk.arcCenter.x + Math.cos(newAngle) * sk.arcRadius;
+        let ny = sk.arcCenter.y + Math.sin(newAngle) * sk.arcRadius;
+
+        // Apply separation from other skaters
+        const sep = this.computeSeparation(sk, active);
+        nx += sep.x * dt * cellsPerM;
+        ny += sep.y * dt * cellsPerM;
 
         if (this.isPassable(nx, ny)) {
           sk.x = nx;
           sk.y = ny;
           sk.dir = newAngle + (sk.arcSpeed > 0 ? Math.PI / 2 : -Math.PI / 2);
         } else {
-          // Bounce off wall — reverse arc direction and pick new center
+          // Pick new arc
           sk.arcSpeed *= -1;
           const r = 15 + Math.random() * 25;
           sk.arcRadius = r;
@@ -152,34 +214,156 @@ export class SkaterSimulation {
           };
         }
       } else {
-        // Hockey/public: straight-line movement with random direction changes
-        const speed = Math.sqrt(sk.vx * sk.vx + sk.vy * sk.vy);
-        const nx = sk.x + sk.vx * cellsPerM * dt;
-        const ny = sk.y + sk.vy * cellsPerM * dt;
-
-        if (this.isPassable(nx, ny)) {
-          sk.x = nx;
-          sk.y = ny;
-          sk.dir = Math.atan2(sk.vy, sk.vx);
-        } else {
-          // Bounce: reflect velocity and add randomness
-          const wallAngle = Math.atan2(ny - this.config.gridH / 2, nx - this.config.gridW / 2);
-          const newAngle = wallAngle + Math.PI + (Math.random() - 0.5) * 1.5;
-          sk.vx = Math.cos(newAngle) * speed;
-          sk.vy = Math.sin(newAngle) * speed;
-          sk.dir = newAngle;
-        }
-
-        // Random direction changes
-        const changeRate = sk.type === 0 ? 0.3 : 0.15; // hockey changes more
-        if (Math.random() < changeRate * dt) {
-          const newAngle = sk.dir + (Math.random() - 0.5) * 1.5;
-          sk.vx = Math.cos(newAngle) * speed;
-          sk.vy = Math.sin(newAngle) * speed;
-          sk.dir = newAngle;
-        }
+        // Hockey/public: steering-based movement
+        this.updateSteering(sk, active, dt, cellsPerM);
       }
     }
+  }
+
+  /** Compute separation force pushing this skater away from nearby skaters. */
+  private computeSeparation(sk: Skater, active: Skater[]): { x: number; y: number } {
+    let fx = 0, fy = 0;
+    for (const other of active) {
+      if (other === sk) continue;
+      const dx = sk.x - other.x;
+      const dy = sk.y - other.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < SEPARATION_DIST && dist > 0.1) {
+        const strength = SEPARATION_FORCE * (1 - dist / SEPARATION_DIST);
+        fx += (dx / dist) * strength;
+        fy += (dy / dist) * strength;
+      }
+    }
+    return { x: fx, y: fy };
+  }
+
+  /** Steering-based update for hockey and public skaters. */
+  private updateSteering(sk: Skater, active: Skater[], dt: number, cellsPerM: number) {
+    const speed = sk.speed * cellsPerM;
+
+    // Check if we've reached target or been stuck too long
+    const toTargetX = sk.targetX - sk.x;
+    const toTargetY = sk.targetY - sk.y;
+    const targetDist = Math.sqrt(toTargetX * toTargetX + toTargetY * toTargetY);
+
+    if (targetDist < 10 || sk.stuckTimer > 3) {
+      const target = this.pickTarget(sk);
+      sk.targetX = target.x;
+      sk.targetY = target.y;
+      sk.stuckTimer = 0;
+    }
+
+    // Desired direction: toward target
+    const toTX = sk.targetX - sk.x;
+    const toTY = sk.targetY - sk.y;
+    const toTLen = Math.sqrt(toTX * toTX + toTY * toTY);
+    let desiredX = toTLen > 0.1 ? toTX / toTLen : Math.cos(sk.dir);
+    let desiredY = toTLen > 0.1 ? toTY / toTLen : Math.sin(sk.dir);
+
+    // Separation force from other skaters
+    const sep = this.computeSeparation(sk, active);
+    desiredX += sep.x * 0.5;
+    desiredY += sep.y * 0.5;
+
+    // Wall avoidance: probe ahead and to the sides
+    const curDir = Math.atan2(sk.vy, sk.vx);
+    const aheadDist = this.wallDistance(sk.x, sk.y, Math.cos(curDir), Math.sin(curDir));
+    if (aheadDist <= WALL_SENSE_DIST) {
+      const wallStrength = WALL_FORCE * (1 - aheadDist / (WALL_SENSE_DIST + 1));
+      // Steer perpendicular to current direction (pick the more open side)
+      const leftDist = this.wallDistance(sk.x, sk.y, Math.cos(curDir - 1.0), Math.sin(curDir - 1.0));
+      const rightDist = this.wallDistance(sk.x, sk.y, Math.cos(curDir + 1.0), Math.sin(curDir + 1.0));
+      const turnDir = leftDist > rightDist ? -1 : 1;
+      desiredX += Math.cos(curDir + turnDir * Math.PI / 2) * wallStrength;
+      desiredY += Math.sin(curDir + turnDir * Math.PI / 2) * wallStrength;
+    }
+
+    // Normalize desired direction
+    const dLen = Math.sqrt(desiredX * desiredX + desiredY * desiredY);
+    if (dLen > 0.01) {
+      desiredX /= dLen;
+      desiredY /= dLen;
+    }
+
+    // Smoothly steer current velocity toward desired direction
+    const targetVx = desiredX * speed;
+    const targetVy = desiredY * speed;
+    const steerFactor = 1 - Math.exp(-STEER_RATE * dt);
+    sk.vx += (targetVx - sk.vx) * steerFactor;
+    sk.vy += (targetVy - sk.vy) * steerFactor;
+
+    // Maintain constant speed
+    const curSpeed = Math.sqrt(sk.vx * sk.vx + sk.vy * sk.vy);
+    if (curSpeed > 0.01) {
+      sk.vx = (sk.vx / curSpeed) * speed;
+      sk.vy = (sk.vy / curSpeed) * speed;
+    }
+
+    // Attempt move
+    const nx = sk.x + sk.vx * dt;
+    const ny = sk.y + sk.vy * dt;
+
+    if (this.isPassable(nx, ny)) {
+      const prevX = sk.x, prevY = sk.y;
+      sk.x = nx;
+      sk.y = ny;
+      sk.dir = Math.atan2(sk.vy, sk.vx);
+
+      // Track stuck detection
+      const moved = Math.sqrt((sk.x - prevX) ** 2 + (sk.y - prevY) ** 2);
+      if (moved < 0.5 * dt) {
+        sk.stuckTimer += dt;
+      } else {
+        sk.stuckTimer = 0;
+      }
+    } else {
+      // Can't move — try sliding along axes
+      const slideX = this.isPassable(nx, sk.y);
+      const slideY = this.isPassable(sk.x, ny);
+      if (slideX) {
+        sk.x = nx;
+        sk.vy *= -0.5; // Dampen perpendicular component
+      } else if (slideY) {
+        sk.y = ny;
+        sk.vx *= -0.5;
+      } else {
+        // Truly stuck — reverse and pick new target
+        sk.vx *= -1;
+        sk.vy *= -1;
+        sk.stuckTimer += dt * 2;
+      }
+      sk.dir = Math.atan2(sk.vy, sk.vx);
+    }
+
+    // Random direction changes (less frequent since steering handles pathing)
+    const changeRate = sk.type === 0 ? 0.15 : 0.08;
+    if (Math.random() < changeRate * dt) {
+      const target = this.pickTarget(sk);
+      sk.targetX = target.x;
+      sk.targetY = target.y;
+    }
+  }
+
+  /** Get info about all active skaters (for debug API). */
+  getActiveSkaters(): Array<{ x: number; y: number; dir: number; type: string; team: number; speed: number; seed: number }> {
+    const typeNames = ['hockey', 'figure', 'public'] as const;
+    return this.skaters.filter(s => s.active).map(s => ({
+      x: s.x,
+      y: s.y,
+      dir: s.dir,
+      type: typeNames[s.type] ?? 'unknown',
+      team: s.team,
+      speed: s.speed,
+      seed: s.seed,
+    }));
+  }
+
+  /** Get a random active skater position for surface damage. */
+  getRandomPosition(): { x: number; y: number; dir: number } | null {
+    const active = this.skaters.filter(s => s.active);
+    if (active.length === 0) return null;
+    const sk = active[Math.floor(Math.random() * active.length)];
+    return { x: sk.x, y: sk.y, dir: sk.dir };
   }
 
   /** Write all active skaters into a SpriteBuffer at slots SLOT_SKATER_BASE+. */
@@ -190,7 +374,7 @@ export class SkaterSimulation {
     for (let i = 0; i < count; i++) {
       const sk = active[i];
       const spriteType = TYPE_TO_SPRITE[sk.type] ?? SpriteType.SKATER_PUBLIC;
-      buf.setSkater(i, sk.x, sk.y, sk.dir, spriteType, sk.team, 3.0);
+      buf.setSkater(i, sk.x, sk.y, sk.dir, spriteType, sk.team, 3.0, sk.phase, sk.heightScale, sk.seed);
     }
 
     buf.setCount(count);

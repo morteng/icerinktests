@@ -122,6 +122,8 @@ fn sprite_count() -> u32 { return sprite_data[0]; }
 @group(0) @binding(5) var<storage, read> sprite_data: array<u32>;
 @group(0) @binding(6) var<storage, read> scratches: array<u32>;
 @group(0) @binding(7) var<storage, read> particle_data: array<u32>;
+// State2: vec4f per cell (snow_density kg/m³, snow_lwc 0-1, mud_amount mm, reserved)
+@group(0) @binding(8) var<storage, read> state2: array<vec4f>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {

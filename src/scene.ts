@@ -1,6 +1,6 @@
 import {
   RinkConfig, RinkPreset, GroundType,
-  createRinkMask, createPipeLayout, createInitialState,
+  createRinkMask, createPipeLayout, createInitialState, createInitialState2,
 } from './rink';
 
 const GROUND_TYPE_MAP: Record<GroundType, number> = {
@@ -8,9 +8,10 @@ const GROUND_TYPE_MAP: Record<GroundType, number> = {
 };
 import { Simulation, DamageInput, ZamboniInput, SimTunables } from './simulation';
 import { Renderer, RenderOptions } from './renderer';
+import { IsometricRenderer } from './isometricRenderer';
 import { CrossSection, computeLayerLayout, LayerLayout } from './crossSection';
 import { createMarkings, MarkingLayout } from './markings';
-import { createSolidsBuffer } from './solids';
+import { createSolidsBuffer, addFenceToSolids } from './solids';
 import { InteractionManager } from './interaction';
 import { Zamboni, MachineType } from './zamboni';
 import { EventScheduler, calculateQualityMetrics, QualityMetrics } from './events';
@@ -18,6 +19,7 @@ import { SkaterSimulation } from './skaters';
 import { SpriteBuffer } from './sprites';
 import { LightingManager, LightDef, computeAtmosphere } from './lighting';
 import { ParticleManager, LandedDeposit } from './particles';
+import { EnvironmentMap, EnvLighting } from './envMap';
 
 /** Inputs from UI → Scene each frame */
 export interface SceneInputs {
@@ -44,6 +46,8 @@ export interface SceneInputs {
   precipIntensity: number;
   simTunables: SimTunables;
   renderFlags: number;
+  exposure: number;
+  skyMode: 'physical' | 'skybox';
 }
 
 /** Serializable state for save/load */
@@ -81,10 +85,12 @@ export class Scene {
   markingsDataCpu: Float32Array;
   solidsData: Float32Array;
   cachedStateData: Float32Array | null = null;
+  cachedState2Data: Float32Array | null = null;
 
   // Systems
   simulation: Simulation;
   renderer: Renderer;
+  isoRenderer: IsometricRenderer;
   crossSection: CrossSection;
   zamboni: Zamboni;
   scheduler: EventScheduler;
@@ -93,9 +99,13 @@ export class Scene {
   spriteBuffer: SpriteBuffer;
   interaction: InteractionManager;
   particleMgr: ParticleManager;
+  envMap: EnvironmentMap;
 
   // Machine type
   machineType: MachineType;
+
+  // Fence state
+  fenceEnabled = false;
 
   // Scene state
   simTime = 0;
@@ -163,7 +173,8 @@ export class Scene {
     const startWater = 0;
     const startTemp = config.isBackyard ? ambientTemp : -4;
     const initialState = createInitialState(config, startTemp, startWater, this.maskData, startIce);
-    this.simulation = new Simulation(device, config, initialState, this.pipeLayoutData, this.maskBuffer, this.solidsBuffer, this.scratchBuffer);
+    const initialState2 = createInitialState2(config, initialState);
+    this.simulation = new Simulation(device, config, initialState, initialState2, this.pipeLayoutData, this.maskBuffer, this.solidsBuffer, this.scratchBuffer);
 
     // Markings
     this.markingsDataCpu = createMarkings(config, this.maskData, markingLayout);
@@ -173,8 +184,12 @@ export class Scene {
     });
     device.queue.writeBuffer(this.markingsBuffer, 0, this.markingsDataCpu);
 
-    // Renderer & cross-section
+    // Environment map (HDRI for 3D view reflections)
+    this.envMap = new EnvironmentMap(device);
+
+    // Renderers & cross-section
     this.renderer = new Renderer(device, format, config, this.simulation, this.markingsBuffer, this.maskBuffer, this.scratchBuffer);
+    this.isoRenderer = new IsometricRenderer(device, format, config, this.simulation, this.markingsBuffer, this.envMap.buffer, this.maskBuffer, this.solidsBuffer);
     this.crossSection = new CrossSection(device, format, config, this.simulation, this.markingsBuffer);
 
     // Game systems
@@ -204,6 +219,20 @@ export class Scene {
     this.zamboni.stop();
     this.machineType = type;
     this.zamboni = new Zamboni(this.config, this.maskData, type, this.solidsData);
+  }
+
+  /** Toggle fence around backyard rink. */
+  toggleFence(enabled: boolean) {
+    this.fenceEnabled = enabled;
+    // Rebuild solids: start fresh from goals, optionally add fence
+    this.solidsData = createSolidsBuffer(this.config, this.maskData);
+    if (enabled && this.config.isBackyard) {
+      addFenceToSolids(this.solidsData, this.config, this.maskData);
+    }
+    this.device.queue.writeBuffer(this.solidsBuffer, 0, this.solidsData);
+    // Rebuild zamboni/skater systems that reference solids
+    this.zamboni = new Zamboni(this.config, this.maskData, this.machineType, this.solidsData);
+    this.particleMgr = new ParticleManager(this.config.gridW, this.config.gridH, this.config.cellSize, this.solidsData);
   }
 
   /** Rewrite markings buffer (e.g. when layout changes). */
@@ -345,6 +374,23 @@ export class Scene {
         // 'auto' when !weatherAuto: undefined → uses default in writeParams
       }
 
+      // Skater surface damage: apply tiny scratches at random skater positions
+      if (!firstDamage && this.skaterSim.count > 0) {
+        const pos = this.skaterSim.getRandomPosition();
+        if (pos) {
+          firstDamage = {
+            active: true,
+            gridX: pos.x,
+            gridY: pos.y,
+            radius: 2,
+            mode: 1,
+            amount: 0.02,
+            velocityX: Math.cos(pos.dir) * 3,
+            velocityY: Math.sin(pos.dir) * 3,
+          };
+        }
+      }
+
       // One-shot events
       const hasOneShot = this.pendingFlood > 0 || this.pendingSnow > 0 || firstDamage !== damageInput;
       if (hasOneShot) {
@@ -439,7 +485,9 @@ export class Scene {
       // Feed cached state for temperature-dependent landing
       this.particleMgr.setCachedState(this.cachedStateData);
     }
-    this.renderer.updateParticles(this.particleMgr.getRenderData());
+    const particleData = this.particleMgr.getRenderData();
+    this.renderer.updateParticles(particleData);
+    // Note: isoRenderer doesn't render particles yet
 
     // Sprites
     this.spriteBuffer.setZamboni(zp);
@@ -447,7 +495,9 @@ export class Scene {
       this.skaterSim.update(simSecsPerFrame);
     }
     this.skaterSim.writeToSpriteBuffer(this.spriteBuffer);
-    this.renderer.updateSprites(this.spriteBuffer.getBuffer());
+    const spriteData = this.spriteBuffer.getBuffer();
+    this.renderer.updateSprites(spriteData);
+    this.isoRenderer.updateSprites(spriteData);
 
     // Time of day
     let timeOfDay: number;
@@ -467,6 +517,23 @@ export class Scene {
 
     // Physically-based sun/sky colors from Rayleigh+Mie atmospheric scattering
     const atmosphere = computeAtmosphere(timeOfDay, cloudCover);
+
+    // In skybox mode (3D view), override sun/sky with HDRI-matched lighting
+    // so the directional lighting matches the sky dome photograph
+    const envPreset = EnvironmentMap.presetForTime(timeOfDay, cloudCover);
+    const useSkyboxLighting = inputs.skyMode === 'skybox' && inputs.renderMode === 3;
+    let sunDir = atmosphere.sunDir;
+    let sunColor = atmosphere.sunColor;
+    let skyColor = atmosphere.skyColor;
+    let skyBrightness = lighting.skyBrightness;
+
+    if (useSkyboxLighting) {
+      const envLighting = EnvironmentMap.lightingForPreset(envPreset);
+      sunDir = envLighting.sunDir;
+      sunColor = envLighting.sunColor;
+      skyColor = envLighting.skyColor;
+      skyBrightness = envLighting.skyBrightness;
+    }
 
     const renderOpts: RenderOptions = {
       showPipes: inputs.showPipes,
@@ -489,23 +556,33 @@ export class Scene {
       animTime: inputs.animTime,
       timeOfDay,
       lights: lighting.lights,
-      skyBrightness: lighting.skyBrightness,
+      skyBrightness,
       fogDensity: lighting.fogDensity,
       cloudCover,
       groundColor: this.config.groundColor,
       surfaceGroundColor: this.config.surfaceGroundColor,
       selectedLight: inputs.selectedLight,
       lightToolActive: inputs.lightToolActive,
-      sunDir: atmosphere.sunDir,
-      sunColor: atmosphere.sunColor,
-      skyColor: atmosphere.skyColor,
+      sunDir,
+      sunColor,
+      skyColor,
       moonDir: atmosphere.moonDir,
       moonPhase: atmosphere.moonPhase,
       renderFlags: inputs.renderFlags,
+      exposure: inputs.exposure,
+      skyMode: inputs.skyMode,
+      groundType: GROUND_TYPE_MAP[this.config.surfaceGroundType],
+      surroundGroundType: GROUND_TYPE_MAP[this.config.groundType],
     };
 
     this.renderOpts = renderOpts;
     this.encoder = encoder;
+
+    // Load appropriate HDRI env map for current conditions (async, non-blocking)
+    // Also load for indoor rinks when skybox mode is active (for sky dome rendering)
+    if (!this.config.isIndoor || inputs.skyMode === 'skybox') {
+      this.envMap.load(envPreset);
+    }
 
     return { timeOfDay };
   }
@@ -520,10 +597,21 @@ export class Scene {
     csView: GPUTextureView,
     csW: number,
     csH: number,
+    mainW?: number,
+    mainH?: number,
   ) {
     if (!this.encoder || !this.renderOpts) return;
 
-    this.renderer.render(this.encoder, mainView, this.simulation.currentBufferIndex, this.renderOpts);
+    // Use grid dimensions if main canvas size not provided
+    const canvasW = mainW ?? this.config.gridW;
+    const canvasH = mainH ?? this.config.gridH;
+
+    // Choose renderer based on mode (3 = isometric)
+    if (this.renderOpts.renderMode === 3) {
+      this.isoRenderer.render(this.encoder, mainView, this.simulation.currentBufferIndex, this.renderOpts, canvasW, canvasH);
+    } else {
+      this.renderer.render(this.encoder, mainView, this.simulation.currentBufferIndex, this.renderOpts);
+    }
 
     this.crossSection.render(
       this.encoder,
@@ -554,6 +642,7 @@ export class Scene {
   getCrossSectionData(cursorGridX: number, cursorGridY: number): {
     iceMm: number; waterMm: number; shavingsMm: number;
     temp: number; flowPos: number; markingType: number;
+    snowDensity: number; snowLwc: number; mudAmount: number;
   } | null {
     if (!this.cachedStateData || !this.pipeLayoutData) return null;
     const idx = cursorGridY * this.config.gridW + cursorGridX;
@@ -565,6 +654,9 @@ export class Scene {
       shavingsMm: this.cachedStateData[idx * 4 + 3],
       flowPos: this.pipeLayoutData[idx],
       markingType: this.markingsDataCpu ? this.markingsDataCpu[idx] : 0,
+      snowDensity: this.cachedState2Data ? this.cachedState2Data[idx * 4 + 0] : 0,
+      snowLwc: this.cachedState2Data ? this.cachedState2Data[idx * 4 + 1] : 0,
+      mudAmount: this.cachedState2Data ? this.cachedState2Data[idx * 4 + 2] : 0,
     };
   }
 
@@ -580,11 +672,13 @@ export class Scene {
     const iceMm = this.config.isBackyard ? 18 : 25;
     const temp = this.config.isBackyard ? -4 : -7;
     const state = createInitialState(this.config, temp, 0, this.maskData, iceMm);
-    this.simulation.reset(state);
+    const state2 = createInitialState2(this.config, state);
+    this.simulation.reset(state, state2);
     // Clear scratch buffer (pristine surface)
     const cellCount = this.config.gridW * this.config.gridH;
     this.device.queue.writeBuffer(this.scratchBuffer, 0, new Uint32Array(cellCount));
     this.cachedStateData = null;
+    this.cachedState2Data = null;
     this.zamboni.stop();
     this.skaterSim.clear();
     this.particleMgr.clear();
@@ -596,7 +690,8 @@ export class Scene {
     const resetWater = 0;
     const resetTemp = this.config.isBackyard ? ambientTemp : -4;
     const state = createInitialState(this.config, resetTemp, resetWater, this.maskData, resetIce);
-    this.simulation.reset(state);
+    const state2 = createInitialState2(this.config, state);
+    this.simulation.reset(state, state2);
     // Clear scratch buffer
     const cellCount = this.config.gridW * this.config.gridH;
     this.device.queue.writeBuffer(this.scratchBuffer, 0, new Uint32Array(cellCount));
@@ -604,6 +699,7 @@ export class Scene {
     this.zamboni.stop();
     this.scheduler.reset();
     this.cachedStateData = null;
+    this.cachedState2Data = null;
     this.lastEventType = '';
     this.skaterSim.clear();
     this.particleMgr.clear();
@@ -651,6 +747,9 @@ export class Scene {
       const data = await this.simulation.readState();
       this.cachedStateData = data;
       this.latestMetrics = calculateQualityMetrics(data, this.config.gridW, this.config.gridH, this.maskData);
+      // Also read state2 for cross-section display
+      const data2 = await this.simulation.readState2();
+      this.cachedState2Data = data2;
     } catch {
       // Ignore readback errors
     }
@@ -685,7 +784,9 @@ export class Scene {
   dispose() {
     this.simulation.destroy();
     this.renderer.destroy();
+    this.isoRenderer.destroy();
     this.crossSection.destroy();
+    this.envMap.destroy();
     this.maskBuffer.destroy();
     this.markingsBuffer.destroy();
     this.solidsBuffer.destroy();

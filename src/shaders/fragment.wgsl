@@ -196,14 +196,20 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
           color *= (1.0 - by_shadow);
         }
 
-        // Snow/shavings overlay (same PBR subsurface as inside rink)
+        // Snow/shavings overlay (density-driven PBR subsurface)
         if (out_shavings > 0.05) {
           let pile_depth = out_shavings;
           let pile_coverage = clamp(pile_depth / 2.0, 0.0, 0.98);
-          let base_albedo = 0.88; // outdoor snow
-          let wetness = clamp(out_water / 1.0, 0.0, 1.0);
-          let albedo = base_albedo * (1.0 - wetness * 0.35);
-          let opacity = 1.0 - exp(-pile_depth / 3.0);
+          let out_s2 = state2[idx];
+          let out_density = max(out_s2.x, 50.0);
+          let out_lwc = out_s2.y;
+          let out_mud = out_s2.z;
+          let out_dfrac = clamp((out_density - 50.0) / (900.0 - 50.0), 0.0, 1.0);
+          let base_albedo = mix(0.88, 0.30, out_dfrac);
+          let albedo = base_albedo * (1.0 - out_lwc * 0.4);
+          let out_mud_frac = clamp(out_mud / 2.0, 0.0, 0.6);
+          let out_efold = mix(3.0, 0.5, out_dfrac);
+          let opacity = 1.0 - exp(-pile_depth / out_efold);
 
           let sun_col_s = get_sun_color();
           let sky_col_s = get_sky_color();
@@ -220,7 +226,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
             light_illum_s += light.color * la * 0.3;
           }
           let total_illum_s = sun_illum_s + sky_illum_s + light_illum_s;
-          let snow_color = vec3f(albedo) * total_illum_s;
+          let out_mud_tint = mix(vec3f(1.0), vec3f(0.45, 0.35, 0.20), out_mud_frac);
+          let snow_color = vec3f(albedo) * out_mud_tint * total_illum_s;
           let noise = hash(f32(px), f32(py));
           let snow_final = snow_color * (0.92 + noise * 0.08);
           color = mix(color, snow_final, opacity * pile_coverage);
@@ -395,19 +402,40 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
             color = mix(color, w_col, w_alpha);
           }
 
-          // Snow/shavings overlay (same PBR as inside rink)
+          // Snow/shavings overlay (density-driven)
           if (out_shavings > 0.05) {
             let pile_coverage = clamp(out_shavings / 2.0, 0.0, 0.98);
-            let albedo = 0.88;
-            let opacity = 1.0 - exp(-out_shavings / 3.0);
-            let snow_illum = vec3f(albedo) * (direct_illum + sky_illum + g_light * 0.5);
-            // Grain noise
+            let osur_s2 = state2[idx];
+            let osur_density = max(osur_s2.x, 50.0);
+            let osur_lwc = osur_s2.y;
+            let osur_mud = osur_s2.z;
+            let osur_dfrac = clamp((osur_density - 50.0) / 850.0, 0.0, 1.0);
+            let albedo = mix(0.88, 0.30, osur_dfrac) * (1.0 - osur_lwc * 0.4);
+            let osur_efold = mix(3.0, 0.5, osur_dfrac);
+            let opacity = 1.0 - exp(-out_shavings / osur_efold);
+            let osur_mf = clamp(osur_mud / 2.0, 0.0, 0.6);
+            let osur_mt = mix(vec3f(1.0), vec3f(0.45, 0.35, 0.20), osur_mf);
+            let snow_illum = vec3f(albedo) * osur_mt * (direct_illum + sky_illum + g_light * 0.5);
             let noise = hash(f32(px), f32(py));
             let snow_final = snow_illum * (0.92 + noise * 0.08);
             color = mix(color, snow_final, pile_coverage * opacity);
           }
 
           color = max(color, vec3f(0.01));
+
+          // Blend distant outdoor ground to sky with animated clouds
+          let sky_start = 8.0;
+          let sky_end = 30.0;
+          let sky_frac = smoothstep(sky_start, sky_end, dist);
+          if (sky_frac > 0.01) {
+            let dim = f32(max(params.width, params.height));
+            let rx = (f32(px) - params.rink_cx) / dim;
+            let ry = (f32(py) - params.rink_cy) / dim;
+            let elev = max(0.08, 1.0 - sqrt(rx * rx + ry * ry) * 1.2);
+            let sky_dir = normalize(vec3f(rx * 0.5, -ry * 0.5, elev));
+            let bg_sky = sample_sky(sky_dir, params.time_of_day, params.sky_brightness, params.cloud_cover, true, params.anim_time);
+            color = mix(color, bg_sky, sky_frac);
+          }
         }
       }
 
@@ -579,25 +607,29 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     let fpx = f32(px) + 0.5;
     let fpy = f32(py) + 0.5;
 
-    // === PBR Snow/Shavings Rendering (subsurface scattering) ===
+    // === PBR Snow/Shavings Rendering (density-driven subsurface scattering) ===
     if (shavings > 0.05) {
       let pile_depth = shavings; // mm
       let pile_coverage = clamp(pile_depth / 2.0, 0.0, 0.98);
 
-      // Snow albedo depends on grain size:
-      // Fresh outdoor snow (small grains): ~0.90
-      // Ice shavings (large grains): ~0.65
-      let is_outdoor = params.is_outdoor > 0u;
-      let base_albedo = select(0.65, 0.88, is_outdoor); // shavings vs snow
+      // Read density/lwc/mud from state2
+      let s2 = state2[idx];
+      let density = max(s2.x, 50.0);
+      let lwc = s2.y;
+      let mud_amt = s2.z;
 
-      // Wet snow/shavings: water fills air gaps → darker (20-40% reduction)
-      let wetness = clamp(water / 1.0, 0.0, 1.0);
-      let albedo = base_albedo * (1.0 - wetness * 0.35);
+      // Density-driven albedo: fresh snow (80) bright, slush (600+) dark
+      let density_frac = clamp((density - 50.0) / (900.0 - 50.0), 0.0, 1.0);
+      let base_albedo = mix(0.88, 0.30, density_frac);
 
-      // Subsurface scattering: light penetrates snow and gets multiply scattered
-      // Outdoor natural snow (density 50-100 kg/m³) is much more opaque than
-      // indoor ice shavings (300-500 kg/m³) due to higher scattering from smaller grains
-      let efold = select(8.0, 3.0, is_outdoor); // 3mm outdoor snow, 8mm indoor shavings
+      // Wet darkening from lwc
+      let albedo = base_albedo * (1.0 - lwc * 0.4);
+
+      // Mud tinting
+      let mud_frac = clamp(mud_amt / 2.0, 0.0, 0.6);
+
+      // Subsurface opacity: denser snow is more opaque
+      let efold = mix(3.0, 0.5, density_frac);
       let opacity = 1.0 - exp(-pile_depth / efold);
 
       // Base snow color: white with subtle blue tint from skylight
@@ -623,10 +655,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
       }
 
       let total_illum = sun_illum + sky_illum + light_illum;
-      let snow_color = vec3f(albedo) * total_illum;
+      // Apply mud tinting to snow color
+      let mud_tint = mix(vec3f(1.0), vec3f(0.45, 0.35, 0.20), mud_frac);
+      let snow_color = vec3f(albedo) * mud_tint * total_illum;
 
-      // GGX micro-facet glints on snow/shaving crystal faces
-      if (pile_depth > 0.3 && has_flag(FLAG_SPARKLE)) {
+      // GGX micro-facet glints on snow/shaving crystal faces (only dry, low-density snow)
+      if (pile_depth > 0.3 && has_flag(FLAG_SPARKLE) && lwc < 0.03 && density < 300.0) {
         let sfh = hash2(f32(px), f32(py), 42.7);
         let sft = hash2(f32(px), f32(py), 91.3) * 0.15;
         let smn = normalize(vec3f(cos(sfh * 6.283) * sft, sin(sfh * 6.283) * sft, 1.0));
@@ -797,6 +831,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
 
     // Light fixtures (physical objects)
     draw_light_fixtures(&color, f32(px) + 0.5, f32(py) + 0.5);
+
+    // Backyard: blend far cells to sky with animated clouds
+    if (params.is_backyard > 0u && sdf > 0.0) {
+      let by_sky_start = 4.0;
+      let by_sky_end = 20.0;
+      let by_sky_frac = smoothstep(by_sky_start, by_sky_end, sdf);
+      if (by_sky_frac > 0.01) {
+        let dim = f32(max(params.width, params.height));
+        let rx = (f32(px) - params.rink_cx) / dim;
+        let ry = (f32(py) - params.rink_cy) / dim;
+        let elev = max(0.08, 1.0 - sqrt(rx * rx + ry * ry) * 1.2);
+        let sky_dir = normalize(vec3f(rx * 0.5, -ry * 0.5, elev));
+        let bg_sky = sample_sky(sky_dir, params.time_of_day, params.sky_brightness, params.cloud_cover, true, params.anim_time);
+        color = mix(color, bg_sky, by_sky_frac);
+      }
+    }
 
     // Cross-section crosshair
     draw_crosshair(&color, px, py);

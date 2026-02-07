@@ -99,9 +99,10 @@ export class SpriteBuffer {
 
   /** Set a single skater at slot SLOT_SKATER_BASE + index. */
   setSkater(index: number, x: number, y: number, dir: number,
-    type: SpriteType, team: number, width: number) {
+    type: SpriteType, team: number, width: number,
+    phase: number = 0, heightScale: number = 1.0, seed: number = 0) {
     const slot = SLOT_SKATER_BASE + index;
-    this.writeSprite(slot, x, y, dir, packInfo(type, team), width, 0, 0, 0);
+    this.writeSprite(slot, x, y, dir, packInfo(type, team), width, heightScale, phase, seed);
   }
 
   /** Write the active sprite count into the header. */

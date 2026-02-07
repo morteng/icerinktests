@@ -88,6 +88,7 @@ export class CrossSection {
 
     const bgl = this.pipeline.getBindGroupLayout(0);
     const [bufA, bufB] = simulation.temperatureBuffers;
+    const [s2A, s2B] = simulation.state2BufferPair;
     const pipeBuffer = simulation.pipeLayoutBuffer;
 
     this.bindGroups = [
@@ -98,6 +99,7 @@ export class CrossSection {
           { binding: 1, resource: { buffer: bufA } },
           { binding: 2, resource: { buffer: pipeBuffer } },
           { binding: 3, resource: { buffer: markingsBuffer } },
+          { binding: 4, resource: { buffer: s2A } },
         ],
       }),
       device.createBindGroup({
@@ -107,6 +109,7 @@ export class CrossSection {
           { binding: 1, resource: { buffer: bufB } },
           { binding: 2, resource: { buffer: pipeBuffer } },
           { binding: 3, resource: { buffer: markingsBuffer } },
+          { binding: 4, resource: { buffer: s2B } },
         ],
       }),
     ];

@@ -17,7 +17,7 @@ const EVAP_RATE = 0.0001;    // mm/s per °C above zero
 const DRAIN_RATE = 0.05;     // fraction per second near board edges
 
 // Snow physics
-const SNOW_REPOSE_THRESHOLD = 1.5;  // mm height diff before sliding
+const SNOW_REPOSE_THRESHOLD = 40;   // mm height diff before sliding (at 80mm/cell baseline)
 const SNOW_TRANSFER_FRAC = 0.3;     // fraction of excess transferred per step
 
 const MAX_DISPATCHES = 20;   // cap GPU work per frame
@@ -137,9 +137,11 @@ export class Simulation {
   private noiseSeed = 0;
 
   private buffers: [GPUBuffer, GPUBuffer];
+  private state2Buffers: [GPUBuffer, GPUBuffer];
   private pipeBuffer: GPUBuffer;
   private paramsBuffer: GPUBuffer;
   private readbackBuffer: GPUBuffer;
+  private readbackBuffer2: GPUBuffer;
 
   private pipeline: GPUComputePipeline;
   private bindGroups: [GPUBindGroup, GPUBindGroup];
@@ -152,6 +154,7 @@ export class Simulation {
     device: GPUDevice,
     config: RinkConfig,
     initialState: Float32Array,
+    initialState2: Float32Array,
     pipeLayout: Float32Array,
     maskBuffer: GPUBuffer,
     solidsBuffer: GPUBuffer,
@@ -176,13 +179,22 @@ export class Simulation {
     device.queue.writeBuffer(this.buffers[0], 0, initialState);
     device.queue.writeBuffer(this.buffers[1], 0, initialState);
 
+    // State2: vec4f per cell (snow_density, snow_lwc, mud_amount, reserved)
+    this.state2Buffers = [
+      device.createBuffer({ size: stateSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+      device.createBuffer({ size: stateSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+    ];
+    device.queue.writeBuffer(this.state2Buffers[0], 0, initialState2);
+    device.queue.writeBuffer(this.state2Buffers[1], 0, initialState2);
+
     this.pipeBuffer = device.createBuffer({ size: pipeSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(this.pipeBuffer, 0, pipeLayout);
 
     this.paramsBuffer = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-    // Readback buffer for quality metrics
+    // Readback buffers for quality metrics
     this.readbackBuffer = device.createBuffer({ size: stateSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    this.readbackBuffer2 = device.createBuffer({ size: stateSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
     const module = device.createShaderModule({ code: heatShaderCode });
     this.pipeline = device.createComputePipeline({
@@ -202,6 +214,8 @@ export class Simulation {
           { binding: 4, resource: { buffer: maskBuffer } },
           { binding: 5, resource: { buffer: solidsBuffer } },
           { binding: 6, resource: { buffer: scratchBuffer } },
+          { binding: 7, resource: { buffer: this.state2Buffers[0] } },
+          { binding: 8, resource: { buffer: this.state2Buffers[1] } },
         ],
       }),
       device.createBindGroup({
@@ -214,6 +228,8 @@ export class Simulation {
           { binding: 4, resource: { buffer: maskBuffer } },
           { binding: 5, resource: { buffer: solidsBuffer } },
           { binding: 6, resource: { buffer: scratchBuffer } },
+          { binding: 7, resource: { buffer: this.state2Buffers[1] } },
+          { binding: 8, resource: { buffer: this.state2Buffers[0] } },
         ],
       }),
     ];
@@ -352,9 +368,18 @@ export class Simulation {
     this.current = 1 - this.current;
   }
 
-  reset(initialState: Float32Array) {
+  reset(initialState: Float32Array, initialState2?: Float32Array) {
     this.device.queue.writeBuffer(this.buffers[0], 0, initialState);
     this.device.queue.writeBuffer(this.buffers[1], 0, initialState);
+    if (initialState2) {
+      this.device.queue.writeBuffer(this.state2Buffers[0], 0, initialState2);
+      this.device.queue.writeBuffer(this.state2Buffers[1], 0, initialState2);
+    } else {
+      // Zero out state2
+      const zeros = new Float32Array(initialState.length);
+      this.device.queue.writeBuffer(this.state2Buffers[0], 0, zeros);
+      this.device.queue.writeBuffer(this.state2Buffers[1], 0, zeros);
+    }
     this.current = 0;
   }
 
@@ -370,15 +395,31 @@ export class Simulation {
     return data;
   }
 
+  async readState2(): Promise<Float32Array> {
+    const currentBuffer = this.state2Buffers[this.current];
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(currentBuffer, 0, this.readbackBuffer2, 0, this.readbackBuffer2.size);
+    this.device.queue.submit([encoder.finish()]);
+
+    await this.readbackBuffer2.mapAsync(GPUMapMode.READ);
+    const data = new Float32Array(this.readbackBuffer2.getMappedRange().slice(0));
+    this.readbackBuffer2.unmap();
+    return data;
+  }
+
   get temperatureBuffers(): readonly [GPUBuffer, GPUBuffer] { return this.buffers; }
+  get state2BufferPair(): readonly [GPUBuffer, GPUBuffer] { return this.state2Buffers; }
   get pipeLayoutBuffer(): GPUBuffer { return this.pipeBuffer; }
   get currentBufferIndex(): number { return this.current; }
 
   destroy() {
     this.buffers[0].destroy();
     this.buffers[1].destroy();
+    this.state2Buffers[0].destroy();
+    this.state2Buffers[1].destroy();
     this.pipeBuffer.destroy();
     this.paramsBuffer.destroy();
     this.readbackBuffer.destroy();
+    this.readbackBuffer2.destroy();
   }
 }
