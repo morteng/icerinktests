@@ -127,17 +127,14 @@ struct VSOut {
 
 fn arena_height(dist: f32) -> f32 {
   let cell_mm = params.cell_size * 1000.0;
-  // Uniform fence height: boards + glass are same height around entire rink
-  let fence_h = 1200.0;  // ~1.2m dasher boards + glass (uniform)
+  // Boards/glass zone (dist 0-4) now rendered as 3D voxel geometry — keep mesh flat
   if (dist < 4.0) {
-    // Boards + glass zone: smooth ramp from ice level to uniform fence height
-    let ramp = smoothstep(-0.5, 2.0, dist);
-    return (fence_h * ramp) / cell_mm;
+    return 0.0;
   } else if (dist < 8.0) {
     // Concourse: flat walkway behind the glass, buffer before seats
-    let t = (dist - 4.0) / 4.0;
     let concourse_h = 300.0;
-    let h = mix(fence_h, concourse_h, smoothstep(0.0, 0.4, t));
+    let t = (dist - 4.0) / 4.0;
+    let h = mix(0.0, concourse_h, smoothstep(0.0, 0.4, t));
     return h / cell_mm;
   } else {
     // Tiered seating: rises with distance — visible amphitheater steps
@@ -173,12 +170,8 @@ fn cell_height(x: u32, y: u32) -> f32 {
     }
   }
 
+  // Fence height displacement removed — handled by 3D voxel stadium geometry
   var h = (s.y + s.z + s.w) / cell_mm;
-  let solid = solids[idx];
-  if (solid > 2.5) {
-    let fence_mm = select(180.0, 220.0, solid < 3.5);
-    h += fence_mm / cell_mm;
-  }
   return h;
 }
 

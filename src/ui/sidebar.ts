@@ -615,11 +615,11 @@ export class Sidebar {
     this.thinFilmCheckbox = thinFilm.checkbox;
     section.appendChild(thinFilm.row);
 
-    const hdSurface = createCheckbox('HD Surface', false);
+    const hdSurface = createCheckbox('HD Surface', true);
     this.hdSurfaceCheckbox = hdSurface.checkbox;
     section.appendChild(hdSurface.row);
 
-    this.damageVisSlider = createSlider({ label: 'Damage Vis', min: 0, max: 5, value: 1, step: 0.1, formatVal: v => `${v.toFixed(1)}x` });
+    this.damageVisSlider = createSlider({ label: 'Damage Vis', min: 0, max: 11, value: 5, step: 0.1, formatVal: v => `${v.toFixed(1)}x` });
     section.appendChild(this.damageVisSlider.row);
 
     // Debug sub-group

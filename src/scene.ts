@@ -18,6 +18,7 @@ import { EventScheduler, calculateQualityMetrics, QualityMetrics } from './event
 import { SkaterSimulation } from './skaters';
 import { SpriteBuffer, SPRITE_BUFFER_SIZE } from './sprites';
 import { LightingManager, LightDef, computeAtmosphere } from './lighting';
+import { generateStadiumGeometry } from './stadiumGeometry';
 import { ParticleManager, LandedDeposit } from './particles';
 import { EnvironmentMap, EnvLighting } from './envMap';
 import { TVCameraController, TVContext } from './tvCamera';
@@ -207,6 +208,9 @@ export class Scene {
     // Renderers & cross-section
     this.renderer = new Renderer(device, format, config, this.simulation, this.markingsBuffer, this.maskBuffer, this.scratchBuffer);
     this.isoRenderer = new IsometricRenderer(device, format, config, this.simulation, this.markingsBuffer, this.envMap.buffer, this.maskBuffer, this.solidsBuffer, this.scratchBuffer);
+    // Generate 3D stadium geometry (boards/glass/fence)
+    const stadiumData = generateStadiumGeometry(config, this.solidsData);
+    this.isoRenderer.setStadiumGeometry(stadiumData);
     this.crossSection = new CrossSection(device, format, config, this.simulation, this.markingsBuffer);
 
     // Game systems
@@ -253,6 +257,9 @@ export class Scene {
     // Rebuild zamboni/skater systems that reference solids
     this.zamboni = new Zamboni(this.config, this.maskData, this.machineType, this.solidsData);
     this.particleMgr = new ParticleManager(this.config.gridW, this.config.gridH, this.config.cellSize, this.solidsData);
+    // Regenerate 3D stadium geometry (fence on/off)
+    const stadiumData = generateStadiumGeometry(this.config, this.solidsData);
+    this.isoRenderer.setStadiumGeometry(stadiumData);
   }
 
   /** Rewrite markings buffer (e.g. when layout changes). */
@@ -522,6 +529,8 @@ export class Scene {
 
     // Sprites
     this.spriteBuffer.setZamboni(zp);
+    // Pass zamboni state to skaters for avoidance behavior
+    this.skaterSim.setZamboniParams(zp.active ? zp : null);
     if (!paused && this.skaterSim.count > 0) {
       this.skaterSim.update(simSecsPerFrame);
     }

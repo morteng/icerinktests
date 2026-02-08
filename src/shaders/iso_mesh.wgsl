@@ -93,48 +93,11 @@ fn fs_iso(in: VSOut) -> @location(0) vec4f {
       let gy = f32(cell_y);
       let noise = hash(gx, gy);
 
-      let bx_rel = (gx - params.rink_cx) / params.rink_hx;
-      let on_near_side = gy > params.rink_cy + params.rink_hy * 0.4;
-      let on_far_side = gy < params.rink_cy - params.rink_hy * 0.4;
-      let in_bench_range = abs(bx_rel) > 0.03 && abs(bx_rel) < 0.35;
-      let in_penalty_range = abs(bx_rel) > 0.03 && abs(bx_rel) < 0.17;
-
-      if (dist < 0.8) {
-        // Kick plate — white metallic strip at base of boards
-        arena_color = vec3f(0.85 + noise * 0.05, 0.85 + noise * 0.04, 0.87 + noise * 0.05);
-        arena_rough = 0.3;
-        arena_f0 = 0.5;
-      } else if (dist < 2.5) {
-        // Boards — wood with bench/penalty coloring
-        if (params.goal_offset > 0.0 && on_near_side && in_bench_range) {
-          if (bx_rel < 0.0) {
-            arena_color = vec3f(0.12 + noise * 0.04, 0.15 + noise * 0.03, 0.42 + noise * 0.06);
-          } else {
-            arena_color = vec3f(0.42 + noise * 0.06, 0.12 + noise * 0.04, 0.12 + noise * 0.03);
-          }
-        } else if (params.goal_offset > 0.0 && on_far_side && in_penalty_range) {
-          arena_color = vec3f(0.38 + noise * 0.05, 0.32 + noise * 0.04, 0.12 + noise * 0.03);
-        } else {
-          let grain = hash(gx, floor(gy * 0.3)) * 0.12;
-          if (u32(gx) % 3u < 1u) {
-            arena_color = vec3f(0.55 + grain, 0.35 + grain * 0.5, 0.18 + grain * 0.25);
-          } else {
-            arena_color = vec3f(0.38 + grain, 0.24 + grain * 0.5, 0.12 + grain * 0.25);
-          }
-        }
-        arena_rough = 0.75;
-        arena_f0 = 0.04;
-      } else if (dist < 4.0) {
-        // Glass/plexiglass barrier — translucent gray, same height as boards
-        let glass_t = (dist - 2.5) / 1.5;
-        if (params.goal_offset > 0.0 &&
-            ((on_near_side && in_bench_range) || (on_far_side && in_penalty_range))) {
-          arena_color = vec3f(0.08 + noise * 0.03, 0.07 + noise * 0.02, 0.12 + noise * 0.03);
-        } else {
-          arena_color = mix(vec3f(0.7, 0.72, 0.75), vec3f(0.5, 0.52, 0.55), glass_t);
-          arena_color += vec3f(noise * 0.05);
-        }
-        arena_rough = 0.15;
+      // Boards/glass zone (dist 0-4) now rendered as 3D voxel geometry.
+      // Mesh shows flat concrete floor beneath the voxel boards.
+      if (dist < 4.0) {
+        arena_color = vec3f(0.10 + noise * 0.04, 0.08 + noise * 0.03, 0.14 + noise * 0.04);
+        arena_rough = 0.8;
         arena_f0 = 0.04;
       } else if (dist < 8.0) {
         // Concourse — wider dark concrete walkway (buffer before seats)
@@ -194,7 +157,7 @@ fn fs_iso(in: VSOut) -> @location(0) vec4f {
           // Crowd density: occupied seats get colorful people, empty seats are darker
           let is_occupied = seat_id < params.crowd_density;
           if (is_occupied) {
-            // Person: random clothing color + skin-tone head
+            // Person: random clothing color + skin-tone head + hair
             let cloth_hue = hash(floor(seat_col) + 0.5, f32(row) + 0.5);
             let cloth_sat = 0.5 + hash(floor(seat_col) + 1.3, f32(row) + 2.1) * 0.4;
             // Generate clothing color from hue
@@ -208,31 +171,59 @@ fn fs_iso(in: VSOut) -> @location(0) vec4f {
             else if (hi == 3u) { cloth_color = vec3f(0.0, 1.0 - h_frac, 1.0); }
             else if (hi == 4u) { cloth_color = vec3f(h_frac, 0.0, 1.0); }
             else { cloth_color = vec3f(1.0, 0.0, 1.0 - h_frac); }
-            cloth_color = mix(vec3f(0.5), cloth_color, cloth_sat) * 0.6;
+
+            // Clothing variety: some wear team jerseys, some casual
+            let wear_type = hash(floor(seat_col) + 9.0, f32(row) + 11.0);
+            if (wear_type > 0.7) {
+              // Team jersey: match section color
+              cloth_color = mix(seat_base, cloth_color, 0.3) * 0.7;
+            } else {
+              cloth_color = mix(vec3f(0.5), cloth_color, cloth_sat) * 0.6;
+            }
+
+            // Hair color per person
+            let hair_seed = hash(floor(seat_col) + 5.0, f32(row) + 9.0);
+            var hair_color: vec3f;
+            if (hair_seed < 0.3) { hair_color = vec3f(0.08, 0.06, 0.04); }       // black
+            else if (hair_seed < 0.55) { hair_color = vec3f(0.25, 0.15, 0.08); }  // brown
+            else if (hair_seed < 0.7) { hair_color = vec3f(0.55, 0.35, 0.15); }   // light brown
+            else if (hair_seed < 0.8) { hair_color = vec3f(0.65, 0.55, 0.20); }   // blonde
+            else if (hair_seed < 0.88) { hair_color = vec3f(0.50, 0.15, 0.08); }  // red
+            else { hair_color = vec3f(0.55, 0.55, 0.52); }                         // gray
+
+            let skin_var = hash(floor(seat_col) + 3.0, f32(row) + 7.0);
+            let skin = mix(vec3f(0.90, 0.72, 0.56), vec3f(0.45, 0.30, 0.20), skin_var);
 
             // Body layout within row: head at front (top), torso behind
             let row_pos = in_row / 0.7; // normalize within seat row area
 
             if (is_waving) {
               // Wave pose: arms up — brighter color, head extends higher
-              if (row_pos < 0.15) {
+              if (row_pos < 0.12) {
                 // Raised arms / hands — skin tone
-                let skin_var = hash(floor(seat_col) + 3.0, f32(row) + 7.0);
-                arena_color = mix(vec3f(0.90, 0.70, 0.55), vec3f(0.50, 0.35, 0.25), skin_var);
+                arena_color = skin;
+              } else if (row_pos < 0.20) {
+                // Hair cap (top of head)
+                arena_color = hair_color;
               } else if (row_pos < 0.30) {
-                // Head — skin tone
-                let skin_var = hash(floor(seat_col) + 3.0, f32(row) + 7.0);
-                arena_color = mix(vec3f(0.85, 0.65, 0.50), vec3f(0.45, 0.30, 0.20), skin_var);
+                // Face — skin tone
+                arena_color = skin;
               } else {
                 // Body — clothing, brightened for excitement
                 arena_color = cloth_color * 1.4;
               }
             } else {
               // Normal seated pose
-              if (row_pos < 0.25) {
-                // Head area — skin tone
-                let skin_var = hash(floor(seat_col) + 3.0, f32(row) + 7.0);
-                arena_color = mix(vec3f(0.85, 0.65, 0.50), vec3f(0.45, 0.30, 0.20), skin_var);
+              if (row_pos < 0.10) {
+                // Hair cap (top of head)
+                arena_color = hair_color;
+              } else if (row_pos < 0.25) {
+                // Face — skin tone
+                arena_color = skin;
+              } else if (row_pos < 0.32) {
+                // Slight front-to-back gradient on torso for 3D depth
+                let depth_shade = 0.85 + (row_pos - 0.25) * 2.0;
+                arena_color = cloth_color * depth_shade;
               } else {
                 arena_color = cloth_color;
               }
@@ -417,59 +408,7 @@ fn fs_iso(in: VSOut) -> @location(0) vec4f {
     f0 = 0.020;
   }
 
-  // ---- Fence material ----
-  let solid_val = solids[idx];
-  var is_fence = solid_val > 2.5;
-  if (is_fence) {
-    let gx = f32(cell_x);
-    let gy = f32(cell_y);
-    let n1 = hash(gx * 1.3, gy * 1.7);
-    let n2 = hash(gx + 73.0, gy + 41.0);
-
-    if (solid_val < 3.5) {
-      let grain = hash(gx, floor(gy * 0.3)) * 0.12;
-      let ring_noise = hash(floor(gx * 0.5) + 17.0, floor(gy * 0.5) + 31.0) * 0.08;
-      base_color = vec3f(0.38 + grain, 0.28 + grain * 0.5, 0.14 + grain * 0.25);
-      base_color += vec3f(ring_noise * 0.5, ring_noise * 0.3, ring_noise * 0.1);
-      let weather = hash(gx * 0.7 + 11.0, gy * 0.7 + 23.0);
-      base_color = mix(base_color, vec3f(0.35, 0.33, 0.30), weather * 0.3);
-      roughness = 0.82;
-      f0 = 0.04;
-    } else {
-      let board_id = floor(gy * 0.4);
-      let board_color_var = hash(board_id, 7.0) * 0.15;
-      let grain = hash(gx * 0.8, board_id) * 0.10;
-      let knot = hash(floor(gx * 0.15), board_id);
-
-      base_color = vec3f(
-        0.50 + grain + board_color_var,
-        0.36 + grain * 0.7 + board_color_var * 0.6,
-        0.18 + grain * 0.3 + board_color_var * 0.3
-      );
-
-      let seam_pos = fract(gy * 0.4);
-      if (seam_pos < 0.08 || seam_pos > 0.92) { base_color *= 0.5; }
-
-      if (knot > 0.93) {
-        base_color = vec3f(0.25, 0.18, 0.08);
-        roughness = 0.9;
-      }
-
-      let rivet_x = fract(gx * 0.15);
-      let rivet_y = fract(gy * 0.4 + 0.2);
-      let rivet_dist = length(vec2f(rivet_x - 0.5, rivet_y - 0.5));
-      if (rivet_dist < 0.15) {
-        base_color = vec3f(0.55, 0.55, 0.52) * (0.8 + n2 * 0.2);
-        roughness = 0.35;
-        f0 = 0.5;
-      } else {
-        let weather = hash(gx * 0.9 + 5.0, gy * 0.9 + 13.0);
-        base_color = mix(base_color, vec3f(0.40, 0.38, 0.34), weather * 0.25);
-        roughness = 0.78;
-        f0 = 0.04;
-      }
-    }
-  }
+  // Fence material removed — handled by 3D voxel stadium geometry
 
   // Snow/shavings
   var snow_sparkle = vec3f(0.0);

@@ -68,6 +68,8 @@ fn vs_sprite(@builtin(vertex_index) vid: u32) -> SpriteVSOut {
   if (st == SPRITE_NONE) { return out; }
   // Zamboni uses voxel box renderer — suppress billboard
   if (st == SPRITE_ZAMBONI) { return out; }
+  // Goals use 3D voxel geometry in indoor arena — suppress billboard sprite
+  if ((st == SPRITE_GOAL_LEFT || st == SPRITE_GOAL_RIGHT) && is_indoor() && !is_backyard()) { return out; }
 
   let size = sprite_billboard_size(sp, st);
   let half_w = size.x * 0.5;

@@ -4,9 +4,11 @@ import isoLighting from './shaders/iso_lighting.wgsl?raw';
 import isoSprites from './shaders/iso_sprites.wgsl?raw';
 import isoMesh from './shaders/iso_mesh.wgsl?raw';
 import isoVoxel from './shaders/iso_voxel.wgsl?raw';
+import isoStadium from './shaders/iso_stadium.wgsl?raw';
 
 const shaderIsometric = isoCommon + '\n' + isoSky + '\n' + isoLighting + '\n' + isoSprites + '\n' + isoMesh;
 const shaderVoxel = isoCommon + '\n' + isoSky + '\n' + isoLighting + '\n' + isoSprites + '\n' + isoVoxel;
+const shaderStadium = isoCommon + '\n' + isoSky + '\n' + isoLighting + '\n' + isoStadium;
 import { Camera } from './camera';
 import { RinkConfig } from './rink';
 import { Simulation } from './simulation';
@@ -26,6 +28,9 @@ export class IsometricRenderer {
   private skyPipeline: GPURenderPipeline;
   private spritePipeline: GPURenderPipeline;
   private voxelPipeline: GPURenderPipeline;
+  private stadiumPipeline: GPURenderPipeline;
+  private stadiumVertexBuffer: GPUBuffer | null = null;
+  private stadiumVertexCount = 0;
   private cameraBuffer: GPUBuffer;
   private paramsBuffer: GPUBuffer;
   private spriteBuffer: GPUBuffer;
@@ -257,6 +262,47 @@ export class IsometricRenderer {
       },
     });
 
+    // Stadium pipeline (3D boards/glass/fence — vertex buffer, alpha blend for glass)
+    const stadiumModule = device.createShaderModule({ code: shaderStadium });
+    // Vertex buffer layout: 9 floats per vertex (36 bytes stride)
+    // position(3f) + normal(3f) + uv(2f) + material(1u32)
+    this.stadiumPipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: stadiumModule,
+        entryPoint: 'vs_stadium',
+        buffers: [{
+          arrayStride: 36,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' as GPUVertexFormat },   // position
+            { shaderLocation: 1, offset: 12, format: 'float32x3' as GPUVertexFormat },  // normal
+            { shaderLocation: 2, offset: 24, format: 'float32x2' as GPUVertexFormat },  // uv
+            { shaderLocation: 3, offset: 32, format: 'uint32' as GPUVertexFormat },     // material
+          ],
+        }],
+      },
+      fragment: {
+        module: stadiumModule,
+        entryPoint: 'fs_stadium',
+        targets: [{
+          format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back',
+      },
+      depthStencil: {
+        format: 'depth24plus',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+      },
+    });
+
     // Store buffer references for bind group rebuilds
     this.stateBuffers = simulation.temperatureBuffers as [GPUBuffer, GPUBuffer];
     this.state2Buffers = simulation.state2BufferPair as [GPUBuffer, GPUBuffer];
@@ -315,6 +361,49 @@ export class IsometricRenderer {
 
   updateSprites(data: Float32Array) {
     this.device.queue.writeBuffer(this.spriteBuffer, 0, data);
+  }
+
+  /** Set stadium geometry vertex data (boards/glass/fence boxes). */
+  setStadiumGeometry(data: Float32Array) {
+    // Data is 9 floats per vertex, but the last float is actually a u32 (material ID).
+    // We need to convert to a properly typed buffer: 8 f32 + 1 u32 per vertex.
+    const vertexCount = data.length / 9;
+    if (vertexCount === 0) {
+      this.stadiumVertexCount = 0;
+      return;
+    }
+
+    // Build a mixed buffer: copy f32 data but bitcast material field to u32
+    const byteSize = vertexCount * 36; // 9 * 4 bytes per vertex
+    const buf = new ArrayBuffer(byteSize);
+    const f32View = new Float32Array(buf);
+    const u32View = new Uint32Array(buf);
+
+    for (let i = 0; i < vertexCount; i++) {
+      const srcOff = i * 9;
+      const dstOff = i * 9;
+      // Copy position (3f), normal (3f), uv (2f) as float
+      f32View[dstOff + 0] = data[srcOff + 0];
+      f32View[dstOff + 1] = data[srcOff + 1];
+      f32View[dstOff + 2] = data[srcOff + 2];
+      f32View[dstOff + 3] = data[srcOff + 3];
+      f32View[dstOff + 4] = data[srcOff + 4];
+      f32View[dstOff + 5] = data[srcOff + 5];
+      f32View[dstOff + 6] = data[srcOff + 6];
+      f32View[dstOff + 7] = data[srcOff + 7];
+      // Material as u32
+      u32View[dstOff + 8] = data[srcOff + 8] | 0; // float → int
+    }
+
+    if (this.stadiumVertexBuffer) {
+      this.stadiumVertexBuffer.destroy();
+    }
+    this.stadiumVertexBuffer = this.device.createBuffer({
+      size: byteSize,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(this.stadiumVertexBuffer, 0, buf);
+    this.stadiumVertexCount = vertexCount;
   }
 
   /** Update atlas textures from canvas data (after sprite injection).
@@ -514,6 +603,13 @@ export class IsometricRenderer {
       reflPass.setPipeline(this.voxelPipeline);
       reflPass.setBindGroup(0, this.reflBindGroups[bufferIndex]);
       reflPass.draw(36); // 6 faces × 6 verts
+      // Stadium geometry in reflection (boards/glass reflect in ice)
+      if (this.stadiumVertexBuffer && this.stadiumVertexCount > 0) {
+        reflPass.setPipeline(this.stadiumPipeline);
+        reflPass.setBindGroup(0, this.reflBindGroups[bufferIndex]);
+        reflPass.setVertexBuffer(0, this.stadiumVertexBuffer);
+        reflPass.draw(this.stadiumVertexCount);
+      }
       reflPass.end();
       this.device.queue.submit([reflEncoder.finish()]);
     }
@@ -545,6 +641,14 @@ export class IsometricRenderer {
     pass.setBindGroup(0, this.bindGroups[bufferIndex]);
     pass.draw(this.vertexCount);
 
+    // Draw stadium geometry (boards/glass/fence — before sprites so skaters occlude correctly)
+    if (this.stadiumVertexBuffer && this.stadiumVertexCount > 0) {
+      pass.setPipeline(this.stadiumPipeline);
+      pass.setBindGroup(0, this.bindGroups[bufferIndex]);
+      pass.setVertexBuffer(0, this.stadiumVertexBuffer);
+      pass.draw(this.stadiumVertexCount);
+    }
+
     // Draw billboard sprites (alpha blended, depth tested against mesh)
     pass.setPipeline(this.spritePipeline);
     pass.setBindGroup(0, this.bindGroups[bufferIndex]);
@@ -568,5 +672,6 @@ export class IsometricRenderer {
     this.reflectionTexture.destroy();
     this.reflectionDepth.destroy();
     this.dummyReflTex.destroy();
+    this.stadiumVertexBuffer?.destroy();
   }
 }

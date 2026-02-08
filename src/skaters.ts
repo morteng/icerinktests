@@ -1,9 +1,52 @@
 import { RinkConfig } from './rink';
 import { SpriteBuffer, SpriteType, SLOT_SKATER_BASE, MAX_SKATERS } from './sprites';
+import { ZamboniParams } from './zamboni';
 
 export { MAX_SKATERS };
 
 export type SkaterType = 'hockey' | 'figure' | 'public';
+
+/** Zamboni info relevant to skater avoidance */
+interface ZamboniAvoidance {
+  x: number;
+  y: number;
+  width: number;   // cells perpendicular
+  length: number;  // cells along travel
+  heading: number;  // radians
+  active: boolean;
+}
+
+/**
+ * Signed distance from point to an axis-aligned rectangle rotated by `heading`.
+ * Returns distance (negative = inside).
+ */
+function distToRotatedRect(
+  px: number, py: number,
+  rx: number, ry: number,
+  halfW: number, halfL: number,
+  heading: number,
+): number {
+  // Transform point into rectangle's local space
+  const dx = px - rx;
+  const dy = py - ry;
+  const ch = Math.cos(-heading);
+  const sh = Math.sin(-heading);
+  const localX = dx * ch - dy * sh;
+  const localY = dx * sh + dy * ch;
+
+  // SDF for axis-aligned rectangle in local space
+  const qx = Math.abs(localX) - halfL;
+  const qy = Math.abs(localY) - halfW;
+
+  if (qx <= 0 && qy <= 0) {
+    // Inside: negative distance
+    return Math.max(qx, qy);
+  }
+  // Outside: Euclidean distance to nearest edge
+  const ox = Math.max(qx, 0);
+  const oy = Math.max(qy, 0);
+  return Math.sqrt(ox * ox + oy * oy);
+}
 
 interface Skater {
   x: number;
@@ -50,6 +93,8 @@ export class SkaterSimulation {
   private solids: Float32Array | null;
   private skaters: Skater[] = [];
   private rinkBounds: { left: number; right: number; top: number; bottom: number };
+  private zamboniAvoid: ZamboniAvoidance | null = null;
+  private benchDoors: { x: number; y: number }[] = [];
 
   constructor(config: RinkConfig, mask: Float32Array, solids: Float32Array | null = null) {
     this.config = config;
@@ -69,6 +114,38 @@ export class SkaterSimulation {
       }
     }
     this.rinkBounds = { left: left + 3, right: right - 3, top: top + 3, bottom: bottom - 3 };
+
+    // Compute bench door positions (near side = high Y, 4 doors)
+    // These match classifySegment() in stadiumGeometry.ts:
+    //   Home doors: bxRel ≈ -0.10, -0.25
+    //   Away doors: bxRel ≈ +0.10, +0.25
+    const rinkCx = config.gridW / 2;
+    const rinkCy = config.gridH / 2;
+    const rinkHx = config.dims.lengthM / config.cellSize / 2;
+    const rinkHy = config.dims.widthM / config.cellSize / 2;
+    const doorBxRels = [-0.25, -0.10, 0.10, 0.25];
+    for (const bxRel of doorBxRels) {
+      this.benchDoors.push({
+        x: rinkCx + rinkHx * bxRel,
+        y: rinkCy + rinkHy - 3, // near side, slightly inward
+      });
+    }
+  }
+
+  /** Update zamboni state for skater avoidance. Call each frame from scene.ts. */
+  setZamboniParams(zp: ZamboniParams | null) {
+    if (!zp || !zp.active) {
+      this.zamboniAvoid = null;
+      return;
+    }
+    this.zamboniAvoid = {
+      x: zp.x,
+      y: zp.y,
+      width: zp.width,
+      length: zp.length,
+      heading: zp.heading,
+      active: true,
+    };
   }
 
   private isInside(x: number, y: number): boolean {
@@ -188,6 +265,23 @@ export class SkaterSimulation {
       sk.phase = (sk.phase + spd * dt * 0.5) % 1.0;
 
       if (sk.type === 1 && sk.arcCenter && sk.arcRadius && sk.arcSpeed) {
+        // Figure skater: check zamboni proximity — switch to steering if too close
+        let figureFleeZamboni = false;
+        if (this.zamboniAvoid && this.zamboniAvoid.active) {
+          const za = this.zamboniAvoid;
+          const dist = distToRotatedRect(
+            sk.x, sk.y, za.x, za.y,
+            za.width / 2, za.length / 2, za.heading,
+          );
+          if (dist < 25) {
+            figureFleeZamboni = true;
+          }
+        }
+
+        if (figureFleeZamboni) {
+          // Use steering-based movement to flee (same as hockey/public)
+          this.updateSteering(sk, active, dt, cellsPerM);
+        } else {
         // Figure skater: follow arc path with separation
         const angle = Math.atan2(sk.y - sk.arcCenter.y, sk.x - sk.arcCenter.x);
         const newAngle = angle + sk.arcSpeed * dt;
@@ -213,6 +307,7 @@ export class SkaterSimulation {
             y: sk.y + Math.sin(sk.dir + Math.PI / 2) * r,
           };
         }
+        } // end else (not fleeing zamboni)
       } else {
         // Hockey/public: steering-based movement
         this.updateSteering(sk, active, dt, cellsPerM);
@@ -276,6 +371,48 @@ export class SkaterSimulation {
       const turnDir = leftDist > rightDist ? -1 : 1;
       desiredX += Math.cos(curDir + turnDir * Math.PI / 2) * wallStrength;
       desiredY += Math.sin(curDir + turnDir * Math.PI / 2) * wallStrength;
+    }
+
+    // Zamboni avoidance: strong repulsion when zamboni is nearby
+    if (this.zamboniAvoid && this.zamboniAvoid.active) {
+      const za = this.zamboniAvoid;
+      const dist = distToRotatedRect(
+        sk.x, sk.y, za.x, za.y,
+        za.width / 2, za.length / 2, za.heading,
+      );
+
+      const avoidRadius = 25; // start avoiding at 25 cells distance
+      if (dist < avoidRadius) {
+        // Direction away from zamboni center
+        const awayX = sk.x - za.x;
+        const awayY = sk.y - za.y;
+        const awayLen = Math.sqrt(awayX * awayX + awayY * awayY);
+
+        if (awayLen > 0.1) {
+          // Stronger force as skater gets closer
+          const urgency = 1 - Math.max(dist, 0) / avoidRadius;
+          const force = 8.0 * urgency * urgency;
+          desiredX += (awayX / awayLen) * force;
+          desiredY += (awayY / awayLen) * force;
+        }
+
+        // If very close, retarget toward nearest bench door
+        if (dist < 12) {
+          let nearestDoor = this.benchDoors[0];
+          let nearestDist = Infinity;
+          for (const door of this.benchDoors) {
+            const ddx = door.x - sk.x;
+            const ddy = door.y - sk.y;
+            const dd = ddx * ddx + ddy * ddy;
+            if (dd < nearestDist) {
+              nearestDist = dd;
+              nearestDoor = door;
+            }
+          }
+          sk.targetX = nearestDoor.x;
+          sk.targetY = nearestDoor.y;
+        }
+      }
     }
 
     // Normalize desired direction
