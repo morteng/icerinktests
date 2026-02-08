@@ -9,7 +9,7 @@ export type MachineState =
   | 'forward'
   | 'stopping'
   | 'blade_up'
-  | 'repositioning'
+  | 'turning'
   | 'exiting';
 
 export interface ZamboniParams {
@@ -19,6 +19,7 @@ export interface ZamboniParams {
   width: number;     // in grid cells (across rink)
   length: number;    // in grid cells (along travel direction)
   dir: number;       // +1 = right, -1 = left
+  heading: number;   // radians (0=+X, PI=-X)
   waterRate: number; // mm/s water deposited to each cell in water zone while active
   heatTemp: number;  // water temperature °C (65 zamboni, 0 shovel)
   speed: number;     // cells per sim-second
@@ -38,8 +39,16 @@ export class Zamboni {
   private x = 0;
   private y = 0;
   private dir = 1;  // +1 right, -1 left
+  private heading = 0; // radians (0=+X, PI=-X)
   private pass = 0;
   private totalPasses: number;
+
+  // Turning arc state
+  private arcAngle = 0;        // current angle through the U-turn (0→PI)
+  private arcCenterX = 0;      // center of the turning arc
+  private arcCenterY = 0;
+  private arcRadius = 0;       // radius of the turning arc
+  private arcStartHeading = 0; // heading at start of turn
 
   // Dimensions in grid cells (set in constructor based on machine type)
   private bodyWidth: number;
@@ -63,6 +72,8 @@ export class Zamboni {
 
   // Pre-computed per-row sweep extents from mask
   private rowExtents: { left: number; right: number }[] = [];
+  private firstPassY = 0;
+  private lastPassY = 0;
 
   constructor(config: RinkConfig, mask: Float32Array, machineType: MachineType, solids: Float32Array | null = null) {
     this.config = config;
@@ -103,13 +114,24 @@ export class Zamboni {
       this.bladeActuateTime = 0.5;
     }
 
-    // Pre-compute per-row extents
+    // Pre-compute per-row extents, inset by half body length + margin
+    // so the entire body stays on ice (center doesn't go to the very edge)
+    const inset = Math.ceil(this.bodyLength / 2) + 2;
     for (let y = 0; y < config.gridH; y++) {
       let left = config.gridW, right = -1;
       for (let x = 0; x < config.gridW; x++) {
         if (mask[y * config.gridW + x] > 0.5) {
           if (x < left) left = x;
           if (x > right) right = x;
+        }
+      }
+      // Inset so body stays fully on ice
+      if (right >= 0) {
+        left += inset;
+        right -= inset;
+        if (left > right) {
+          left = config.gridW;
+          right = -1; // row too narrow
         }
       }
       this.rowExtents.push({ left, right });
@@ -125,9 +147,23 @@ export class Zamboni {
       }
     }
 
+    // Find first and last rows that are inside the rink, inset by body width margin
+    // so turns don't extend into the fence
+    const yInset = Math.ceil(this.bodyWidth / 2) + 2;
+    let firstValidY = 0;
+    let lastValidY = config.gridH - 1;
+    for (let y = 0; y < config.gridH; y++) {
+      if (this.rowExtents[y].right >= 0) { firstValidY = y + yInset; break; }
+    }
+    for (let y = config.gridH - 1; y >= 0; y--) {
+      if (this.rowExtents[y].right >= 0) { lastValidY = y - yInset; break; }
+    }
+    this.firstPassY = Math.max(firstValidY, 0);
+    this.lastPassY = Math.min(lastValidY, config.gridH - 1);
+
     this.totalPasses = 0;
-    for (let y = 0; y < config.gridH; y += this.sweepOffset) {
-      const ext = this.rowExtents[y];
+    for (let y = this.firstPassY; y <= this.lastPassY; y += this.sweepOffset) {
+      const ext = this.rowExtents[Math.min(y, config.gridH - 1)];
       if (ext.right >= 0) this.totalPasses++;
     }
   }
@@ -152,6 +188,7 @@ export class Zamboni {
     this._active = true;
     this.pass = 0;
     this.dir = 1;
+    this.heading = 0; // facing +X
     this.currentSpeed = 0;
     this._bladeDown = false;
     this._waterOn = false;
@@ -166,15 +203,17 @@ export class Zamboni {
     this._waterOn = false;
     this._state = 'idle';
     this.currentSpeed = 0;
+    this.heading = 0;
   }
 
   private moveToPass(passIndex: number) {
     let count = 0;
-    for (let y = 0; y < this.config.gridH; y += this.sweepOffset) {
-      const ext = this.rowExtents[y];
+    for (let y = this.firstPassY; y <= this.lastPassY; y += this.sweepOffset) {
+      const clampedY = Math.min(y, this.config.gridH - 1);
+      const ext = this.rowExtents[clampedY];
       if (ext.right < 0) continue;
       if (count === passIndex) {
-        this.y = y;
+        this.y = clampedY;
         this.x = this.dir > 0 ? ext.left : ext.right;
         return;
       }
@@ -197,7 +236,8 @@ export class Zamboni {
         // Move to first row at 50% speed, blade/water off
         const enterSpeed = this.targetSpeed * 0.5;
         this.currentSpeed = enterSpeed;
-        this.x += enterSpeed * simSeconds * this.dir;
+        this.x += enterSpeed * simSeconds * Math.cos(this.heading);
+        this.y += enterSpeed * simSeconds * Math.sin(this.heading);
 
         // Check if we've reached the starting position of the first row
         const rowY = Math.max(0, Math.min(Math.round(this.y), this.config.gridH - 1));
@@ -225,19 +265,20 @@ export class Zamboni {
         if (this.currentSpeed < this.targetSpeed) {
           this.currentSpeed = Math.min(this.targetSpeed, this.currentSpeed + this.targetSpeed / Math.max(this.accelTime, 0.1) * simSeconds);
         }
-        this.x += this.currentSpeed * simSeconds * this.dir;
+        this.x += this.currentSpeed * simSeconds * Math.cos(this.heading);
+        this.y += this.currentSpeed * simSeconds * Math.sin(this.heading);
 
         // Check row end
-        const rowY = Math.max(0, Math.min(Math.round(this.y), this.config.gridH - 1));
-        const ext = this.rowExtents[rowY];
-        if (ext.right < 0) {
+        const rowY2 = Math.max(0, Math.min(Math.round(this.y), this.config.gridH - 1));
+        const ext2 = this.rowExtents[rowY2];
+        if (ext2.right < 0) {
           this.transitionTo('exiting');
           break;
         }
 
-        const reachedEnd = this.dir > 0 ? this.x >= ext.right : this.x <= ext.left;
+        const reachedEnd = this.dir > 0 ? this.x >= ext2.right : this.x <= ext2.left;
         if (reachedEnd) {
-          this.x = this.dir > 0 ? ext.right : ext.left;
+          this.x = this.dir > 0 ? ext2.right : ext2.left;
           this.transitionTo('stopping');
         }
         break;
@@ -246,7 +287,8 @@ export class Zamboni {
       case 'stopping': {
         // Decelerate to 0
         this.currentSpeed = Math.max(0, this.currentSpeed - this.targetSpeed / Math.max(this.accelTime, 0.1) * simSeconds);
-        this.x += this.currentSpeed * simSeconds * this.dir;
+        this.x += this.currentSpeed * simSeconds * Math.cos(this.heading);
+        this.y += this.currentSpeed * simSeconds * Math.sin(this.heading);
         if (this.currentSpeed <= 0.01) {
           this.currentSpeed = 0;
           this.transitionTo('blade_up');
@@ -265,17 +307,63 @@ export class Zamboni {
           if (this.pass >= this.totalPasses) {
             this.transitionTo('exiting');
           } else {
-            this.transitionTo('repositioning');
+            this.transitionTo('turning');
           }
         }
         break;
       }
 
-      case 'repositioning': {
-        // Flip direction, move to next pass row
-        this.dir = this.dir > 0 ? -1 : 1;
-        this.moveToPass(this.pass);
-        this.transitionTo('blade_down');
+      case 'turning': {
+        // Smooth semicircular U-turn between rows
+        // On first frame of turning state, set up arc parameters
+        if (this.stateTimer === simSeconds) {
+          // Arc radius = half the row spacing (sweepOffset / 2)
+          this.arcRadius = this.sweepOffset / 2;
+          this.arcAngle = 0;
+          this.arcStartHeading = this.heading;
+          // Arc center is offset perpendicular to current heading (toward next row)
+          // Next row is always in +Y direction (rows increment in Y)
+          this.arcCenterX = this.x;
+          this.arcCenterY = this.y + this.arcRadius;
+        }
+
+        // Turn speed: 40% of target speed
+        const turnSpeed = this.targetSpeed * 0.4;
+        this.currentSpeed = turnSpeed;
+
+        // Angular velocity = linear speed / radius
+        const angularVel = turnSpeed / Math.max(this.arcRadius, 1);
+        this.arcAngle += angularVel * simSeconds;
+
+        if (this.arcAngle >= Math.PI) {
+          // Turn complete: snap to next row position
+          this.arcAngle = Math.PI;
+          this.dir = this.dir > 0 ? -1 : 1;
+          this.heading = this.dir > 0 ? 0 : Math.PI;
+          // Position at end of arc
+          this.x = this.arcCenterX;
+          this.y = this.arcCenterY + this.arcRadius;
+          this.currentSpeed = 0;
+          this.transitionTo('blade_down');
+        } else {
+          // Interpolate position on semicircular arc
+          // Start angle depends on current direction:
+          // dir=+1 (was going right): arc goes from 3PI/2 (bottom) to PI/2 (top), sweeping through 0 (right)
+          // Wait — we need to go from current position in a U-turn to the next row.
+          // If dir=+1, we were going right. We're at the right end.
+          // The arc should curve up (toward next row in +Y) and come back going left.
+          // Arc center is at (x, y + radius). Start at bottom of circle (angle = -PI/2 from center).
+          // End at top (angle = +PI/2). Heading rotates from 0 to PI.
+          const startAngleOnCircle = this.dir > 0 ? -Math.PI / 2 : Math.PI / 2;
+          const turnDirection = this.dir > 0 ? 1 : -1;
+          const currentAngleOnCircle = startAngleOnCircle + turnDirection * this.arcAngle;
+
+          this.x = this.arcCenterX + this.arcRadius * Math.cos(currentAngleOnCircle);
+          this.y = this.arcCenterY + this.arcRadius * Math.sin(currentAngleOnCircle);
+          this.heading = this.arcStartHeading + this.arcAngle * turnDirection;
+          // Normalize heading to [0, 2PI)
+          this.heading = ((this.heading % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+        }
         break;
       }
 
@@ -298,6 +386,7 @@ export class Zamboni {
       width: this.bodyWidth,
       length: this.bodyLength,
       dir: this.dir,
+      heading: this.heading,
       waterRate: this._waterRate,
       heatTemp: this._heatTemp,
       speed: this.currentSpeed,

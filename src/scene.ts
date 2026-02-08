@@ -368,6 +368,7 @@ export class Scene {
         width: zp.width,
         length: zp.length,
         dir: zp.dir,
+        heading: zp.heading,
         waterRate: zp.waterRate,
         heatTemp: zp.heatTemp,
         speed: zp.speed,

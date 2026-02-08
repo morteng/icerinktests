@@ -90,6 +90,8 @@ export const DEFAULT_SIM_TUNABLES_OUTDOOR: SimTunables = {
 // [37] damage_amount (f32) — configurable mm per application
 // [38] damage_temp (f32) — water temperature for damage mode 2
 // [39] damage_dir (f32) — packed angle of mouse movement for scratch direction
+// ...
+// [47] zamboni_heading (f32) — heading in radians
 
 export interface DamageInput {
   active: boolean;
@@ -110,6 +112,7 @@ export interface ZamboniInput {
   width: number;
   length: number;
   dir: number;
+  heading: number;
   waterRate: number;
   heatTemp: number;
   speed: number;
@@ -369,7 +372,7 @@ export class Simulation {
     f32[45] = this._windY;                                   // wind_y
     this.noiseSeed = (this.noiseSeed + 1) & 0xFFFFFFFF;
     u32[46] = this.noiseSeed;                                // noise_seed
-    f32[47] = 0;                                             // _pad47
+    f32[47] = zamboni?.heading ?? 0;                           // zamboni_heading
 
     this.device.queue.writeBuffer(this.paramsBuffer, 0, data);
   }

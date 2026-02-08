@@ -57,7 +57,7 @@ struct SimParams {
   wind_x: f32,
   wind_y: f32,
   noise_seed: u32,
-  _pad47: f32,
+  zamboni_heading: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: SimParams;
@@ -854,8 +854,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let fx = f32(x);
     let fy = f32(y);
 
-    let dy_z = abs(fy - zy);
-    let dx_z = (fx - zx) * zdir; // 0=rear, zl=front
+    // Rotate cell position into zamboni-local frame using heading
+    let ch = cos(params.zamboni_heading);
+    let sh = sin(params.zamboni_heading);
+    let rel_x = fx - zx;
+    let rel_y = fy - zy;
+    let dx_z = rel_x * ch + rel_y * sh;      // along travel direction (0=rear, zl=front)
+    let dy_z = abs(-rel_x * sh + rel_y * ch); // perpendicular distance
     let hw = zw * 0.5;
 
     // Three-way detection: shovel=no shave+no water, water_tank=no shave+has water, zamboni=else
@@ -870,11 +875,17 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         water *= (1.0 - clear_rate * 0.3);
       }
 
-      let behind_x = i32(x) - i32(zdir);
-      if (behind_x >= 0 && behind_x < i32(params.width)) {
-        let behind_i = cell(u32(behind_x), y);
-        let behind_dx = (f32(behind_x) - zx) * zdir;
-        let behind_dy = abs(f32(y) - zy);
+      // For shovel push: sample the cell behind (along travel direction)
+      let behind_fx = fx - ch; // one cell back along heading
+      let behind_fy = fy - sh;
+      let behind_ix = i32(behind_fx);
+      let behind_iy = i32(behind_fy);
+      if (behind_ix >= 0 && behind_ix < i32(params.width) && behind_iy >= 0 && behind_iy < i32(params.height)) {
+        let behind_i = cell(u32(behind_ix), u32(behind_iy));
+        let brel_x = f32(behind_ix) - zx;
+        let brel_y = f32(behind_iy) - zy;
+        let behind_dx = brel_x * ch + brel_y * sh;
+        let behind_dy = abs(-brel_x * sh + brel_y * ch);
         if (behind_dy < hw && behind_dx >= 0.0 && behind_dx < zl) {
           let push_rate = min(1.0, 5.0 * dt * zspeed / zl);
           let pushed = state_in[behind_i].w * push_rate;

@@ -91,9 +91,10 @@ export class SpriteBuffer {
     const type = zp.machineType === 'zamboni' ? SpriteType.ZAMBONI
       : zp.machineType === 'water_tank' ? SpriteType.WATER_TANK
       : SpriteType.SHOVEL;
+    // dir field: heading in radians for zamboni (used by voxel renderer)
     // Encode bladeDown in aux1 bit 0 (as float: 1.0 = blade down, 0.0 = blade up)
     const aux1 = zp.bladeDown ? 1.0 : 0.0;
-    this.writeSprite(SLOT_ZAMBONI, zp.x, zp.y, zp.dir,
+    this.writeSprite(SLOT_ZAMBONI, zp.x, zp.y, zp.heading,
       packInfo(type, 0), zp.width, zp.length, zp.speed, aux1);
   }
 

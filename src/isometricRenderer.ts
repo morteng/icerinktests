@@ -3,8 +3,10 @@ import isoSky from './shaders/iso_sky.wgsl?raw';
 import isoLighting from './shaders/iso_lighting.wgsl?raw';
 import isoSprites from './shaders/iso_sprites.wgsl?raw';
 import isoMesh from './shaders/iso_mesh.wgsl?raw';
+import isoVoxel from './shaders/iso_voxel.wgsl?raw';
 
 const shaderIsometric = isoCommon + '\n' + isoSky + '\n' + isoLighting + '\n' + isoSprites + '\n' + isoMesh;
+const shaderVoxel = isoCommon + '\n' + isoSky + '\n' + isoLighting + '\n' + isoSprites + '\n' + isoVoxel;
 import { Camera } from './camera';
 import { RinkConfig } from './rink';
 import { Simulation } from './simulation';
@@ -23,6 +25,7 @@ export class IsometricRenderer {
   private meshPipeline: GPURenderPipeline;
   private skyPipeline: GPURenderPipeline;
   private spritePipeline: GPURenderPipeline;
+  private voxelPipeline: GPURenderPipeline;
   private cameraBuffer: GPUBuffer;
   private paramsBuffer: GPUBuffer;
   private spriteBuffer: GPUBuffer;
@@ -225,6 +228,27 @@ export class IsometricRenderer {
       primitive: {
         topology: 'triangle-list',
         cullMode: 'none',
+      },
+      depthStencil: {
+        format: 'depth24plus',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+      },
+    });
+
+    // Voxel pipeline (3D zamboni box — back-face culled, depth write+test)
+    const voxelModule = device.createShaderModule({ code: shaderVoxel });
+    this.voxelPipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: { module: voxelModule, entryPoint: 'vs_voxel' },
+      fragment: {
+        module: voxelModule,
+        entryPoint: 'fs_voxel',
+        targets: [{ format }],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back',
       },
       depthStencil: {
         format: 'depth24plus',
@@ -486,6 +510,10 @@ export class IsometricRenderer {
       reflPass.setPipeline(this.spritePipeline);
       reflPass.setBindGroup(0, this.reflBindGroups[bufferIndex]);
       reflPass.draw(MAX_SPRITES * 6);
+      // Voxel zamboni box in reflection
+      reflPass.setPipeline(this.voxelPipeline);
+      reflPass.setBindGroup(0, this.reflBindGroups[bufferIndex]);
+      reflPass.draw(36); // 6 faces × 6 verts
       reflPass.end();
       this.device.queue.submit([reflEncoder.finish()]);
     }
@@ -521,6 +549,11 @@ export class IsometricRenderer {
     pass.setPipeline(this.spritePipeline);
     pass.setBindGroup(0, this.bindGroups[bufferIndex]);
     pass.draw(MAX_SPRITES * 6);
+
+    // Draw voxel zamboni box (opaque, depth tested)
+    pass.setPipeline(this.voxelPipeline);
+    pass.setBindGroup(0, this.bindGroups[bufferIndex]);
+    pass.draw(36); // 6 faces × 6 verts
 
     pass.end();
   }

@@ -66,6 +66,8 @@ fn vs_sprite(@builtin(vertex_index) vid: u32) -> SpriteVSOut {
   let sp = read_sprite(slot);
   let st = sprite_type(sp);
   if (st == SPRITE_NONE) { return out; }
+  // Zamboni uses voxel box renderer — suppress billboard
+  if (st == SPRITE_ZAMBONI) { return out; }
 
   let size = sprite_billboard_size(sp, st);
   let half_w = size.x * 0.5;
