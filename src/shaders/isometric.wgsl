@@ -41,7 +41,11 @@ struct Params {
   exposure: f32,
   lights: array<Light, 12>,
   surround_color: vec3f,  // surround ground color (outside rink mask)
-  _pad_surr: f32,
+  contrast: f32,
+  saturation: f32,
+  _pad_a: f32,
+  _pad_b: f32,
+  _pad_c: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;
@@ -149,14 +153,42 @@ fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
   return gv * gl;
 }
 
-// ACES filmic tone mapping — matches 2D renderer (preserves hue, rolls off highlights)
-fn aces_tonemap(x: vec3f) -> vec3f {
-  let a = 2.51;
-  let b = 0.03;
-  let c = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
+// AgX tonemapping — better highlight handling than ACES, preserves hue
+fn agx_contrast(x: vec3f) -> vec3f {
+  let x2 = x * x;
+  let x4 = x2 * x2;
+  let v = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+  return v;
+}
+
+fn agx_tonemap(val: vec3f) -> vec3f {
+  let agx_mat = mat3x3f(
+    0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+    0.0784335999999992, 0.878468636469772, 0.0784336,
+    0.0792237451477643, 0.0791661274605434, 0.879142973793104
+  );
+  let agx_mat_inv = mat3x3f(
+    1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+    -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+    -0.0990297440797205, -0.0989611768448433, 1.15107367264116
+  );
+
+  let min_ev = -12.47393;
+  let max_ev = 4.026069;
+
+  var v = agx_mat * val;
+  v = clamp(log2(max(v, vec3f(1e-10))), vec3f(min_ev), vec3f(max_ev));
+  v = (v - min_ev) / (max_ev - min_ev);
+  v = agx_contrast(v);
+
+  // Configurable look — contrast power + saturation boost from params
+  let luma = dot(v, vec3f(0.2126, 0.7152, 0.0722));
+  v = pow(v, vec3f(params.contrast));
+  v = vec3f(luma) + (v - vec3f(luma)) * params.saturation;
+
+  v = agx_mat_inv * v;
+
+  return clamp(v, vec3f(0.0), vec3f(1.0));
 }
 
 // ---- Hash / noise ----
@@ -775,7 +807,7 @@ fn fs_iso(in: VSOut) -> @location(0) vec4f {
   result *= params.exposure;
 
   // ACES filmic tonemapping (matches 2D renderer)
-  result = aces_tonemap(result);
+  result = agx_tonemap(result);
 
   return vec4f(result, 1.0);
 }
@@ -826,7 +858,7 @@ fn fs_sky(in: SkyVSOut) -> @location(0) vec4f {
   color *= params.exposure;
 
   // ACES tonemapping
-  color = aces_tonemap(color);
+  color = agx_tonemap(color);
 
   return vec4f(color, 1.0);
 }
@@ -1408,7 +1440,7 @@ fn sprite_light_3d(world_pos: vec3f, base_color: vec3f) -> vec3f {
 
   var result = base_color * (ambient + diffuse);
   result *= params.exposure;
-  result = aces_tonemap(result);
+  result = agx_tonemap(result);
   return result;
 }
 

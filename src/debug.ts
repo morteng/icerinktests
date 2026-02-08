@@ -4,6 +4,8 @@
  */
 import { SceneManager } from './sceneManager';
 import { Scene } from './scene';
+import { injectSpriteRow, SpriteDrawFn, ROW_COUNT, MAX_ROW_COUNT } from './spriteSheet';
+import { SpriteStudioRenderer, RenderSpriteOptions } from './spriteStudio';
 
 export interface DebugCallbacks {
   setAmbient: (temp: number) => void;
@@ -18,11 +20,22 @@ export class IceDebug {
   private sceneManager: SceneManager;
   private canvas: HTMLCanvasElement;
   private cb: DebugCallbacks;
+  private device: GPUDevice;
+  private format: GPUTextureFormat;
+  private studioRenderer: SpriteStudioRenderer | null = null;
 
-  constructor(sceneManager: SceneManager, canvas: HTMLCanvasElement, callbacks: DebugCallbacks) {
+  constructor(
+    sceneManager: SceneManager,
+    canvas: HTMLCanvasElement,
+    callbacks: DebugCallbacks,
+    device: GPUDevice,
+    format: GPUTextureFormat,
+  ) {
     this.sceneManager = sceneManager;
     this.canvas = canvas;
     this.cb = callbacks;
+    this.device = device;
+    this.format = format;
     console.log('[IceDebug] Debug API ready. Try: iceDebug.help()');
   }
 
@@ -56,6 +69,10 @@ export class IceDebug {
       '  setCameraPreset(p)  — corner|top|front|side|tv|oblique',
       '  screenshot()        — return canvas data URL',
       '  readFullState()     — async GPU readback of full state',
+      'SPRITE STUDIO:',
+      '  injectSprite(row, drawFn)   — inject custom sprite at row 8-15',
+      '  renderSprite(opts)           — GPU-render sprite, returns PNG data URL',
+      '  placeSprite(slot, opts)      — place sprite in scene at slot 35-63',
     ];
   }
 
@@ -232,5 +249,74 @@ export class IceDebug {
   /** Async: full GPU readback of simulation state. */
   async readFullState(): Promise<Float32Array> {
     return await this.scene.simulation.readState();
+  }
+
+  // ==================== SPRITE STUDIO METHODS ====================
+
+  /**
+   * Inject a custom sprite into atlas row (8-15).
+   * drawFn signature: (ctx, col, row, dir, frame, phase, frameW, frameH) => void
+   * Use cellX(col) and cellY(row) for pixel offsets; frameW/frameH give actual frame size.
+   */
+  injectSprite(row: number, drawFn: SpriteDrawFn) {
+    if (row < ROW_COUNT || row >= MAX_ROW_COUNT) {
+      console.error(`[IceDebug] injectSprite: row must be ${ROW_COUNT}-${MAX_ROW_COUNT - 1}, got ${row}`);
+      return;
+    }
+    const { colorCanvas, heightCanvas } = injectSpriteRow(row, drawFn);
+
+    // Refresh scene's isometric renderer atlas textures
+    this.scene.isoRenderer.refreshAtlasTextures(colorCanvas, heightCanvas);
+
+    // Refresh studio renderer if initialized
+    if (this.studioRenderer) {
+      this.studioRenderer.refreshAtlasTextures(colorCanvas, heightCanvas);
+    }
+
+    console.log('[IceDebug] Sprite injected at row %d (type %d)', row, row + 1);
+  }
+
+  /**
+   * GPU-render a single sprite in isolation. Returns PNG data URL.
+   * opts: { spriteType, direction, team?, frame?, sunAzimuth?, sunElevation?, ... }
+   */
+  async renderSprite(opts: RenderSpriteOptions): Promise<string> {
+    if (!this.studioRenderer) {
+      this.studioRenderer = new SpriteStudioRenderer(this.device, this.format);
+    }
+    return await this.studioRenderer.renderSprite(opts);
+  }
+
+  /** Get the studio renderer (for UI panel). */
+  getStudioRenderer(): SpriteStudioRenderer {
+    if (!this.studioRenderer) {
+      this.studioRenderer = new SpriteStudioRenderer(this.device, this.format);
+    }
+    return this.studioRenderer;
+  }
+
+  /**
+   * Place a sprite in the scene at a sprite buffer slot (35-63).
+   * opts: { x, y, type, team?, dir?, phase?, seed? }
+   */
+  placeSprite(slot: number, opts: {
+    x: number; y: number; type: number;
+    team?: number; dir?: number; phase?: number; seed?: number;
+    heightScale?: number;
+  }) {
+    if (slot < 35 || slot > 63) {
+      console.error('[IceDebug] placeSprite: slot must be 35-63, got', slot);
+      return;
+    }
+    const s = this.scene;
+    s.spriteBuffer.setCustom(
+      slot, opts.x, opts.y, opts.dir ?? 0,
+      opts.type, opts.team ?? 0, 0,
+      opts.heightScale ?? 1.0, opts.phase ?? 0, opts.seed ?? 0.5,
+    );
+    // Ensure sprite count includes this slot
+    const currentCount = 64; // always keep max for visibility
+    s.spriteBuffer.setCount(currentCount);
+    console.log('[IceDebug] Placed sprite type %d at slot %d (%d,%d)', opts.type, slot, opts.x, opts.y);
   }
 }

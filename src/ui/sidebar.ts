@@ -52,6 +52,8 @@ export class Sidebar {
   onPrep: (() => void) | null = null;
   onCameraPreset: ((preset: CameraPreset) => void) | null = null;
   onCameraOrthoToggle: ((ortho: boolean) => void) | null = null;
+  onCameraZoom: ((delta: number) => void) | null = null;
+  onCameraFit: (() => void) | null = null;
   onFenceToggle: ((enabled: boolean) => void) | null = null;
   onSpriteViewer: (() => void) | null = null;
 
@@ -154,8 +156,11 @@ export class Sidebar {
   private snowReposeSlider!: SliderResult;
   private snowTransferSlider!: SliderResult;
 
-  // Exposure
+  // Exposure + color grading
   private exposureSlider!: SliderResult;
+  private contrastSlider!: SliderResult;
+  private saturationSlider!: SliderResult;
+  private lookSelect!: HTMLSelectElement;
 
   // Render flags
   private shadowsCheckbox!: HTMLInputElement;
@@ -163,6 +168,7 @@ export class Sidebar {
   private scratchesCheckbox!: HTMLInputElement;
   private sparkleCheckbox!: HTMLInputElement;
   private thinFilmCheckbox!: HTMLInputElement;
+  private hdSurfaceCheckbox!: HTMLInputElement;
 
   // Playback (sticky)
   private pauseBtn!: HTMLButtonElement;
@@ -219,6 +225,16 @@ export class Sidebar {
 
     this.speedSlider = createSlider({ label: 'Speed', min: 1, max: 1000, value: 10, step: 1, formatVal: v => `${v}` });
     sticky.appendChild(this.speedSlider.row);
+
+    const s1Btn = createButton('1x');
+    const s10Btn = createButton('10x');
+    const s100Btn = createButton('100x');
+    const sMaxBtn = createButton('Max');
+    sticky.appendChild(createButtonRow(s1Btn, s10Btn, s100Btn, sMaxBtn));
+    s1Btn.addEventListener('click', () => this.speedSlider.setVal(1));
+    s10Btn.addEventListener('click', () => this.speedSlider.setVal(10));
+    s100Btn.addEventListener('click', () => this.speedSlider.setVal(100));
+    sMaxBtn.addEventListener('click', () => this.speedSlider.setVal(1000));
 
     const auto = createCheckbox('Auto', false);
     this.autoModeCheckbox = auto.checkbox;
@@ -432,6 +448,11 @@ export class Sidebar {
     const tvBtn = createButton('TV');
     this.cameraPanel.appendChild(createButtonRow(obliqueBtn, topBtn, frontBtn, sideBtn, cornerBtn, tvBtn));
 
+    const zoomInBtn = createButton('Zoom +');
+    const zoomOutBtn = createButton('Zoom -');
+    const zoomFitBtn = createButton('Fit');
+    this.cameraPanel.appendChild(createButtonRow(zoomInBtn, zoomOutBtn, zoomFitBtn));
+
     section.appendChild(this.cameraPanel);
 
     // Wire camera events
@@ -445,13 +466,16 @@ export class Sidebar {
     sideBtn.addEventListener('click', presetClick('side'));
     cornerBtn.addEventListener('click', presetClick('corner'));
     tvBtn.addEventListener('click', presetClick('tv'));
+    zoomInBtn.addEventListener('click', () => this.onCameraZoom?.(-0.15));
+    zoomOutBtn.addEventListener('click', () => this.onCameraZoom?.(0.15));
+    zoomFitBtn.addEventListener('click', () => this.onCameraFit?.());
 
     // Sky mode (visible only in isometric/3D mode)
     const skyMode = createSelect({
       label: 'Sky',
       options: [
-        { value: 'physical', text: 'Physical', selected: true },
-        { value: 'skybox', text: 'Skybox (HDRI)' },
+        { value: 'physical', text: 'Physical' },
+        { value: 'skybox', text: 'Skybox (HDRI)', selected: true },
       ],
     });
     this.skyModeSelect = skyMode.select;
@@ -461,6 +485,40 @@ export class Sidebar {
     // Exposure slider
     this.exposureSlider = createSlider({ label: 'Exposure', min: -3, max: 3, value: 0, step: 0.1, short: true, formatVal: v => v === 0 ? '0' : (v > 0 ? `+${v.toFixed(1)}` : v.toFixed(1)) });
     section.appendChild(this.exposureSlider.row);
+
+    // Color grading sub-group
+    section.appendChild(createSubGroup('Color Grading'));
+
+    const look = createSelect({
+      label: 'Look',
+      options: [
+        { value: 'punchy', text: 'Punchy', selected: true },
+        { value: 'neutral', text: 'Neutral' },
+        { value: 'vivid', text: 'Vivid' },
+        { value: 'cinematic', text: 'Cinematic' },
+      ],
+    });
+    this.lookSelect = look.select;
+    section.appendChild(look.row);
+
+    this.contrastSlider = createSlider({ label: 'Contrast', min: 0.5, max: 2.0, value: 1.35, step: 0.05, short: true, formatVal: v => v.toFixed(2) });
+    section.appendChild(this.contrastSlider.row);
+
+    this.saturationSlider = createSlider({ label: 'Saturation', min: 0.0, max: 2.0, value: 1.4, step: 0.05, short: true, formatVal: v => v.toFixed(2) });
+    section.appendChild(this.saturationSlider.row);
+
+    // Look preset events
+    this.lookSelect.addEventListener('change', () => {
+      const presets: Record<string, [number, number]> = {
+        neutral:    [1.0,  1.0],
+        punchy:     [1.35, 1.4],
+        vivid:      [1.5,  1.8],
+        cinematic:  [1.4,  1.2],
+      };
+      const [c, s] = presets[this.lookSelect.value] ?? [1.35, 1.4];
+      this.contrastSlider.setVal(c);
+      this.saturationSlider.setVal(s);
+    });
 
     // Overlays sub-group
     section.appendChild(createSubGroup('Overlays'));
@@ -542,11 +600,15 @@ export class Sidebar {
     this.thinFilmCheckbox = thinFilm.checkbox;
     section.appendChild(thinFilm.row);
 
+    const hdSurface = createCheckbox('HD Surface', false);
+    this.hdSurfaceCheckbox = hdSurface.checkbox;
+    section.appendChild(hdSurface.row);
+
     // Debug sub-group
     section.appendChild(createSubGroup('Debug'));
-    const spriteViewerBtn = createButton('Sprite Atlas');
-    section.appendChild(createButtonRow(spriteViewerBtn));
-    spriteViewerBtn.addEventListener('click', () => this.onSpriteViewer?.());
+    const spriteStudioBtn = createButton('Sprite Studio');
+    section.appendChild(createButtonRow(spriteStudioBtn));
+    spriteStudioBtn.addEventListener('click', () => this.onSpriteViewer?.());
 
     this.el.appendChild(section);
 
@@ -869,6 +931,7 @@ export class Sidebar {
   get precipIntensityVal(): number { return parseFloat(this.precipIntensity.slider.value); }
   get skyMode(): 'physical' | 'skybox' { return this.skyModeSelect.value as 'physical' | 'skybox'; }
   get fenceEnabled(): boolean { return this.fenceCheckbox.checked; }
+  get hdSurface(): boolean { return this.hdSurfaceCheckbox.checked; }
 
   get simTunables(): SimTunables {
     return {
@@ -887,6 +950,9 @@ export class Sidebar {
   get exposure(): number {
     return Math.pow(2, parseFloat(this.exposureSlider.slider.value));
   }
+
+  get contrast(): number { return parseFloat(this.contrastSlider.slider.value); }
+  get saturation(): number { return parseFloat(this.saturationSlider.slider.value); }
 
   get renderFlags(): number {
     let flags = 0;
@@ -968,6 +1034,9 @@ export class Sidebar {
     this.surfaceCtrl.classList.toggle('hidden', !config.isBackyard);
     this.fenceCtrl.classList.toggle('hidden', !config.isBackyard);
     this.weatherControls.style.display = config.isIndoor ? 'none' : '';
+
+    // Default sky mode: skybox for indoor, physical for outdoor
+    this.skyModeSelect.value = config.isIndoor ? 'skybox' : 'physical';
 
     if (config.isBackyard) {
       this.ambientSlider.slider.min = '-30';

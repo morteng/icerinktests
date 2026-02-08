@@ -14,11 +14,12 @@ import { getOrCreateAtlas, getOrCreateHeightAtlas, createAtlasTexture, createAtl
 
 // mat4x4 (64) + mat4x4 (64) + mat4x4 (64) + vec3 (12) + pad (4) + vec3 (12) + pad (4) = 224
 const CAMERA_PARAMS_SIZE = 224;
-// Params layout: 28 scalars (112 bytes) + 12 lights × 32 bytes (384) = 496 bytes
-const RENDER_PARAMS_SIZE = 496;
+// Params layout: 24 scalars (96 bytes) + 12 lights × 32 bytes (384) + surround(12)+contrast(4)+sat(4)+arena(28)+pad(4) = 544 bytes
+const RENDER_PARAMS_SIZE = 544;
 
 export class IsometricRenderer {
   private device: GPUDevice;
+  private format: GPUTextureFormat;
   private meshPipeline: GPURenderPipeline;
   private skyPipeline: GPURenderPipeline;
   private spritePipeline: GPURenderPipeline;
@@ -28,11 +29,30 @@ export class IsometricRenderer {
   private atlasTexture: GPUTexture;
   private heightAtlasTexture: GPUTexture;
   private atlasSampler: GPUSampler;
-  private bindGroups: [GPUBindGroup, GPUBindGroup];
+  private bindGroups!: [GPUBindGroup, GPUBindGroup];
+  private bindGroupLayout!: GPUBindGroupLayout;
+  // Stored for bind group rebuilds (atlas texture resize)
+  private stateBuffers!: [GPUBuffer, GPUBuffer];
+  private state2Buffers!: [GPUBuffer, GPUBuffer];
+  private markingsBuffer!: GPUBuffer;
+  private envMapBuffer!: GPUBuffer;
+  private maskBuffer!: GPUBuffer;
+  private solidsBuffer!: GPUBuffer;
   private depthTexture: GPUTexture;
   private depthView: GPUTextureView;
   private depthW = 0;
   private depthH = 0;
+  // Reflection pass textures (sprites rendered to offscreen for ice reflections)
+  private reflectionTexture: GPUTexture;
+  private reflectionView: GPUTextureView;
+  private reflectionDepth: GPUTexture;
+  private reflectionDepthView: GPUTextureView;
+  private reflW = 0;
+  private reflH = 0;
+  // 1x1 dummy texture used in reflection pass bind group to avoid texture usage conflict
+  private dummyReflTex: GPUTexture;
+  // Separate bind groups for reflection pass (uses dummy tex at binding 12)
+  private reflBindGroups!: [GPUBindGroup, GPUBindGroup];
   private gridW: number;
   private gridH: number;
   private vertexCount: number;
@@ -48,8 +68,10 @@ export class IsometricRenderer {
     envMapBuffer: GPUBuffer,
     maskBuffer: GPUBuffer,
     solidsBuffer: GPUBuffer,
+    private scratchBuffer: GPUBuffer,
   ) {
     this.device = device;
+    this.format = format;
     this.gridW = config.gridW;
     this.gridH = config.gridH;
     this.cellSize = config.cellSize;
@@ -103,10 +125,26 @@ export class IsometricRenderer {
     });
     this.depthView = this.depthTexture.createView();
 
+    // Reflection pass textures (sprites rendered offscreen for ice reflections)
+    this.reflW = config.gridW;
+    this.reflH = config.gridH;
+    this.reflectionTexture = device.createTexture({
+      size: [this.reflW, this.reflH],
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.reflectionView = this.reflectionTexture.createView();
+    this.reflectionDepth = device.createTexture({
+      size: [this.reflW, this.reflH],
+      format: 'depth24plus',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    this.reflectionDepthView = this.reflectionDepth.createView();
+
     const module = device.createShaderModule({ code: shaderIsometric });
 
     // Explicit bind group layout shared between mesh, sky, and sprite pipelines
-    const bindGroupLayout = device.createBindGroupLayout({
+    this.bindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
@@ -120,11 +158,13 @@ export class IsometricRenderer {
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       ],
     });
 
     const pipelineLayout = device.createPipelineLayout({
-      bindGroupLayouts: [bindGroupLayout],
+      bindGroupLayouts: [this.bindGroupLayout],
     });
 
     // Mesh pipeline (depth write enabled, depth compare less)
@@ -193,51 +233,92 @@ export class IsometricRenderer {
       },
     });
 
-    const [bufA, bufB] = simulation.temperatureBuffers;
-    const [s2A, s2B] = simulation.state2BufferPair;
+    // Store buffer references for bind group rebuilds
+    this.stateBuffers = simulation.temperatureBuffers as [GPUBuffer, GPUBuffer];
+    this.state2Buffers = simulation.state2BufferPair as [GPUBuffer, GPUBuffer];
+    this.markingsBuffer = markingsBuffer;
+    this.envMapBuffer = envMapBuffer;
+    this.maskBuffer = maskBuffer;
+    this.solidsBuffer = solidsBuffer;
 
+    // Dummy 1x1 texture used in reflection pass bind groups (avoids texture usage conflict)
+    this.dummyReflTex = device.createTexture({
+      size: [1, 1],
+      format,
+      usage: GPUTextureUsage.TEXTURE_BINDING,
+    });
+
+    this.rebuildBindGroups();
+  }
+
+  private rebuildBindGroups() {
+    const [bufA, bufB] = this.stateBuffers;
+    const [s2A, s2B] = this.state2Buffers;
     const heightView = this.heightAtlasTexture.createView();
+    const reflView = this.reflectionTexture.createView();
+    const dummyReflView = this.dummyReflTex.createView();
 
+    const makeEntries = (stateBuf: GPUBuffer, s2Buf: GPUBuffer, reflTex: GPUTextureView) => [
+      { binding: 0, resource: { buffer: this.cameraBuffer } },
+      { binding: 1, resource: { buffer: this.paramsBuffer } },
+      { binding: 2, resource: { buffer: stateBuf } },
+      { binding: 3, resource: { buffer: this.markingsBuffer } },
+      { binding: 4, resource: { buffer: this.envMapBuffer } },
+      { binding: 5, resource: { buffer: this.maskBuffer } },
+      { binding: 6, resource: { buffer: s2Buf } },
+      { binding: 7, resource: { buffer: this.solidsBuffer } },
+      { binding: 8, resource: { buffer: this.spriteBuffer } },
+      { binding: 9, resource: this.atlasTexture.createView() },
+      { binding: 10, resource: this.atlasSampler },
+      { binding: 11, resource: heightView },
+      { binding: 12, resource: reflTex },
+      { binding: 13, resource: { buffer: this.scratchBuffer } },
+    ];
+
+    // Main pass bind groups (use actual reflection texture for ice reflections)
     this.bindGroups = [
-      device.createBindGroup({
-        layout: bindGroupLayout,
-        entries: [
-          { binding: 0, resource: { buffer: this.cameraBuffer } },
-          { binding: 1, resource: { buffer: this.paramsBuffer } },
-          { binding: 2, resource: { buffer: bufA } },
-          { binding: 3, resource: { buffer: markingsBuffer } },
-          { binding: 4, resource: { buffer: envMapBuffer } },
-          { binding: 5, resource: { buffer: maskBuffer } },
-          { binding: 6, resource: { buffer: s2A } },
-          { binding: 7, resource: { buffer: solidsBuffer } },
-          { binding: 8, resource: { buffer: this.spriteBuffer } },
-          { binding: 9, resource: this.atlasTexture.createView() },
-          { binding: 10, resource: this.atlasSampler },
-          { binding: 11, resource: heightView },
-        ],
-      }),
-      device.createBindGroup({
-        layout: bindGroupLayout,
-        entries: [
-          { binding: 0, resource: { buffer: this.cameraBuffer } },
-          { binding: 1, resource: { buffer: this.paramsBuffer } },
-          { binding: 2, resource: { buffer: bufB } },
-          { binding: 3, resource: { buffer: markingsBuffer } },
-          { binding: 4, resource: { buffer: envMapBuffer } },
-          { binding: 5, resource: { buffer: maskBuffer } },
-          { binding: 6, resource: { buffer: s2B } },
-          { binding: 7, resource: { buffer: solidsBuffer } },
-          { binding: 8, resource: { buffer: this.spriteBuffer } },
-          { binding: 9, resource: this.atlasTexture.createView() },
-          { binding: 10, resource: this.atlasSampler },
-          { binding: 11, resource: heightView },
-        ],
-      }),
+      this.device.createBindGroup({ layout: this.bindGroupLayout, entries: makeEntries(bufA, s2A, reflView) }),
+      this.device.createBindGroup({ layout: this.bindGroupLayout, entries: makeEntries(bufB, s2B, reflView) }),
+    ];
+
+    // Reflection pass bind groups (use dummy texture at binding 12 to avoid conflict
+    // with reflection texture being used as render target in the same pass)
+    this.reflBindGroups = [
+      this.device.createBindGroup({ layout: this.bindGroupLayout, entries: makeEntries(bufA, s2A, dummyReflView) }),
+      this.device.createBindGroup({ layout: this.bindGroupLayout, entries: makeEntries(bufB, s2B, dummyReflView) }),
     ];
   }
 
   updateSprites(data: Float32Array) {
     this.device.queue.writeBuffer(this.spriteBuffer, 0, data);
+  }
+
+  /** Update atlas textures from canvas data (after sprite injection).
+   *  Recreates textures + bind groups if canvas dimensions changed. */
+  refreshAtlasTextures(colorCanvas: HTMLCanvasElement, heightCanvas: HTMLCanvasElement) {
+    const needsResize =
+      colorCanvas.width !== this.atlasTexture.width ||
+      colorCanvas.height !== this.atlasTexture.height;
+
+    if (needsResize) {
+      this.atlasTexture.destroy();
+      this.heightAtlasTexture.destroy();
+      this.atlasTexture = createAtlasTexture(this.device, colorCanvas);
+      this.heightAtlasTexture = createAtlasTexture(this.device, heightCanvas);
+      // Bind groups reference the old texture views — must rebuild
+      this.rebuildBindGroups();
+    } else {
+      this.device.queue.copyExternalImageToTexture(
+        { source: colorCanvas },
+        { texture: this.atlasTexture },
+        [colorCanvas.width, colorCanvas.height],
+      );
+      this.device.queue.copyExternalImageToTexture(
+        { source: heightCanvas },
+        { texture: this.heightAtlasTexture },
+        [heightCanvas.width, heightCanvas.height],
+      );
+    }
   }
 
   private ensureDepthTexture(w: number, h: number) {
@@ -251,6 +332,31 @@ export class IsometricRenderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.depthView = this.depthTexture.createView();
+
+    // Also resize reflection textures (same dimensions as main)
+    this.ensureReflectionTextures(w, h);
+  }
+
+  private ensureReflectionTextures(w: number, h: number) {
+    if (w === this.reflW && h === this.reflH) return;
+    this.reflectionTexture.destroy();
+    this.reflectionDepth.destroy();
+    this.reflW = w;
+    this.reflH = h;
+    this.reflectionTexture = this.device.createTexture({
+      size: [w, h],
+      format: this.format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.reflectionView = this.reflectionTexture.createView();
+    this.reflectionDepth = this.device.createTexture({
+      size: [w, h],
+      format: 'depth24plus',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    this.reflectionDepthView = this.reflectionDepth.createView();
+    // Bind groups reference the reflection texture view — must rebuild
+    this.rebuildBindGroups();
   }
 
   render(
@@ -291,10 +397,10 @@ export class IsometricRenderer {
     u32[0] = this.gridW;
     u32[1] = this.gridH;
     u32[2] = opts.showMarkings ? 1 : 0;
-    // flags: bit0=outdoor, bit1=backyard, bit2=skybox, bits3-4=surface_ground_type, bits5-6=surround_ground_type
+    // flags: bit0=outdoor, bit1=backyard, bit2=skybox, bits3-4=surface_ground_type, bits5-6=surround_ground_type, bit7=hd_surface
     const surfGt = opts.groundType ?? 0;
     const surrGt = opts.surroundGroundType ?? 0;
-    u32[3] = (opts.isOutdoor ? 1 : 0) | (opts.isBackyard ? 2 : 0) | (opts.skyMode === 'skybox' ? 4 : 0) | ((surfGt & 3) << 3) | ((surrGt & 3) << 5);
+    u32[3] = (opts.isOutdoor ? 1 : 0) | (opts.isBackyard ? 2 : 0) | (opts.skyMode === 'skybox' ? 4 : 0) | ((surfGt & 3) << 3) | ((surrGt & 3) << 5) | (opts.hdSurface ? 128 : 0);
     // Surface ground color (inside rink mask — what shows through ice)
     f32[4] = opts.surfaceGroundColor[0];
     f32[5] = opts.surfaceGroundColor[1];
@@ -339,7 +445,17 @@ export class IsometricRenderer {
     f32[120] = opts.groundColor[0];
     f32[121] = opts.groundColor[1];
     f32[122] = opts.groundColor[2];
-    // f32[123] = padding (already zero)
+    f32[123] = opts.contrast ?? 1.35;
+    f32[124] = opts.saturation ?? 1.4;
+    // Arena geometry + crowd density
+    f32[125] = opts.rinkCx;
+    f32[126] = opts.rinkCy;
+    f32[127] = opts.rinkHx;
+    f32[128] = opts.rinkHy;
+    f32[129] = opts.rinkCr;
+    f32[130] = opts.goalOffset;
+    f32[131] = opts.crowdDensity ?? 0.0;
+    // f32[132-135] = padding (already zero)
 
     this.device.queue.writeBuffer(this.paramsBuffer, 0, data);
 
@@ -348,6 +464,33 @@ export class IsometricRenderer {
     const skyG = Math.max(opts.skyColor[1] * 0.15, 0.02);
     const skyB = Math.max(opts.skyColor[2] * 0.15, 0.04);
 
+    // --- Pass 1: Render sprites to offscreen reflection texture (separate encoder) ---
+    // Must be a separate submission because the reflection texture is both
+    // a render target here and a texture binding in the main pass.
+    {
+      const reflEncoder = this.device.createCommandEncoder();
+      const reflPass = reflEncoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.reflectionView,
+          loadOp: 'clear' as GPULoadOp,
+          storeOp: 'store' as GPUStoreOp,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        }],
+        depthStencilAttachment: {
+          view: this.reflectionDepthView,
+          depthLoadOp: 'clear' as GPULoadOp,
+          depthStoreOp: 'store' as GPUStoreOp,
+          depthClearValue: 1.0,
+        },
+      });
+      reflPass.setPipeline(this.spritePipeline);
+      reflPass.setBindGroup(0, this.reflBindGroups[bufferIndex]);
+      reflPass.draw(MAX_SPRITES * 6);
+      reflPass.end();
+      this.device.queue.submit([reflEncoder.finish()]);
+    }
+
+    // --- Pass 2: Main render (sky + mesh + sprites) ---
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
         view: textureView,
@@ -369,6 +512,7 @@ export class IsometricRenderer {
     pass.draw(6);
 
     // Draw mesh on top (depth write enabled, will occlude sky)
+    // Mesh shader samples reflection texture for ice reflections
     pass.setPipeline(this.meshPipeline);
     pass.setBindGroup(0, this.bindGroups[bufferIndex]);
     pass.draw(this.vertexCount);
@@ -388,5 +532,8 @@ export class IsometricRenderer {
     this.atlasTexture.destroy();
     this.heightAtlasTexture.destroy();
     this.depthTexture.destroy();
+    this.reflectionTexture.destroy();
+    this.reflectionDepth.destroy();
+    this.dummyReflTex.destroy();
   }
 }

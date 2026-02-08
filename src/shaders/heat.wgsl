@@ -70,6 +70,33 @@ struct SimParams {
 // State2: vec4f per cell (snow_density kg/m³, snow_lwc 0-1, mud_amount mm, reserved)
 @group(0) @binding(7) var<storage, read> state2_in: array<vec4f>;
 @group(0) @binding(8) var<storage, read_write> state2_out: array<vec4f>;
+// Sprite buffer (same format as render shader): 4 u32 header + 64×8 u32 sprites
+@group(0) @binding(9) var<storage, read> sprite_buf: array<u32>;
+
+const SPRITE_MAX: u32 = 64u;
+
+struct SpriteInfo {
+  x: f32,
+  y: f32,
+  dir: f32,
+  stype: u32,
+  width: f32,
+  height: f32,
+}
+
+fn read_sim_sprite(slot: u32) -> SpriteInfo {
+  let base = 4u + slot * 8u;
+  return SpriteInfo(
+    bitcast<f32>(sprite_buf[base + 0u]),
+    bitcast<f32>(sprite_buf[base + 1u]),
+    bitcast<f32>(sprite_buf[base + 2u]),
+    sprite_buf[base + 3u] & 0xFu,
+    bitcast<f32>(sprite_buf[base + 4u]),
+    bitcast<f32>(sprite_buf[base + 5u]),
+  );
+}
+
+fn sim_sprite_count() -> u32 { return sprite_buf[0]; }
 
 fn cell(x: u32, y: u32) -> u32 {
   return y * params.width + x;
@@ -927,6 +954,63 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         shavings *= max(0.0, 1.0 - 0.5 * dt * y_fade);
       }
     }
+  }
+
+  // --- Skater surface effects (GPU-side: all skaters apply damage, snow tracks) ---
+  {
+    let dt = params.sim_dt;
+    let sc = min(sim_sprite_count(), SPRITE_MAX);
+    let fx = f32(x);
+    let fy = f32(y);
+
+    for (var si = 0u; si < sc; si++) {
+      let sp = read_sim_sprite(si);
+      // Only process skater types (1=hockey, 2=figure, 3=public)
+      if (sp.stype < 1u || sp.stype > 3u) { continue; }
+
+      let dx = fx - sp.x;
+      let dy = fy - sp.y;
+      let dist2 = dx * dx + dy * dy;
+
+      // Ice damage + scratches: within ~2.5 cell radius
+      if (dist2 < 6.5 && ice > 0.1) {
+        let strength = exp(-dist2 * 0.5); // Gaussian falloff
+        let damage_rate = select(0.15, 0.30, sp.stype == 1u); // hockey=0.30, figure/public=0.15 mm/s
+        let dmg = damage_rate * dt * strength;
+        ice -= dmg;
+        shavings += dmg * 0.6; // 60% becomes shavings
+
+        // Scratch direction encoding (same as mouse damage)
+        if (strength > 0.10) {
+          let angle = sp.dir;
+          let dir_f = (angle / 0.7854 + 8.0) % 8.0;
+          let dir8 = u32(dir_f + 0.5) % 8u;
+          let existing = scratches[i];
+          let old_density = (existing >> 8u) & 0xFFu;
+          let old_primary = existing & 0xFFu;
+          let add_density = u32(strength * 60.0); // faster scratch buildup
+          let new_density = min(old_density + add_density, 255u);
+          var new_dir2 = (existing >> 16u) & 0xFFu;
+          if (old_density > 10u && old_primary != dir8) {
+            new_dir2 = old_primary;
+          }
+          scratches[i] = dir8 | (new_density << 8u) | (new_dir2 << 16u);
+        }
+      }
+
+      // Snow displacement: within ~3 cell radius
+      if (dist2 < 9.0 && shavings > 0.1) {
+        let strength = exp(-dist2 * 0.35);
+        // Compress snow under skater (reduce height)
+        let compress = min(shavings * 0.15 * dt * strength, shavings * 0.5);
+        shavings -= compress;
+        // Increase density (compaction)
+        if (snow_density > 0.0 && snow_density < 600.0) {
+          snow_density += strength * 50.0 * dt;
+        }
+      }
+    }
+    ice = max(ice, 0.0);
   }
 
   state_out[i] = vec4f(T, ice, water, shavings);

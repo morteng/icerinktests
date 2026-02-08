@@ -273,6 +273,11 @@ export class Camera {
     }
   }
 
+  // Direct setters (used by SpriteStudio for programmatic control)
+  setAzimuth(a: number) { this.azimuth = a; this.updatePosition(); }
+  setElevation(e: number) { this.elevation = Math.max(0.1, Math.min(Math.PI / 2 - 0.01, e)); this.updatePosition(); }
+  setDistance(d: number) { this.distance = Math.max(50, Math.min(2000, d)); this.updatePosition(); }
+
   // Mouse controls
   orbit(deltaAzimuth: number, deltaElevation: number) {
     if (this.locked) return;

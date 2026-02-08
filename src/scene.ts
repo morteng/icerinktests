@@ -16,7 +16,7 @@ import { InteractionManager } from './interaction';
 import { Zamboni, MachineType } from './zamboni';
 import { EventScheduler, calculateQualityMetrics, QualityMetrics } from './events';
 import { SkaterSimulation } from './skaters';
-import { SpriteBuffer } from './sprites';
+import { SpriteBuffer, SPRITE_BUFFER_SIZE } from './sprites';
 import { LightingManager, LightDef, computeAtmosphere } from './lighting';
 import { ParticleManager, LandedDeposit } from './particles';
 import { EnvironmentMap, EnvLighting } from './envMap';
@@ -47,7 +47,10 @@ export interface SceneInputs {
   simTunables: SimTunables;
   renderFlags: number;
   exposure: number;
+  contrast: number;
+  saturation: number;
   skyMode: 'physical' | 'skybox';
+  hdSurface: boolean;
 }
 
 /** Serializable state for save/load */
@@ -78,6 +81,7 @@ export class Scene {
   markingsBuffer: GPUBuffer;
   solidsBuffer: GPUBuffer;
   scratchBuffer: GPUBuffer;
+  spriteGpuBuffer: GPUBuffer; // shared sprite buffer for compute shader
 
   // CPU data copies
   maskData: Float32Array;
@@ -113,6 +117,10 @@ export class Scene {
   pendingSnow = 0;
   frameCount = 0;
   lastEventType = '';
+
+  // Crowd density (0.0-1.0, spectator fill for indoor arena seats)
+  crowdDensity = 0;
+  private _crowdTarget = 0;
 
   // Snowball rate limiter
   private _snowballAccum = 0;
@@ -168,13 +176,19 @@ export class Scene {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
+    // Shared GPU sprite buffer (read by compute shader for skater effects)
+    this.spriteGpuBuffer = device.createBuffer({
+      size: SPRITE_BUFFER_SIZE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
     // Initial state
     const startIce = config.isBackyard ? 0 : 12;
     const startWater = 0;
     const startTemp = config.isBackyard ? ambientTemp : -4;
     const initialState = createInitialState(config, startTemp, startWater, this.maskData, startIce);
     const initialState2 = createInitialState2(config, initialState);
-    this.simulation = new Simulation(device, config, initialState, initialState2, this.pipeLayoutData, this.maskBuffer, this.solidsBuffer, this.scratchBuffer);
+    this.simulation = new Simulation(device, config, initialState, initialState2, this.pipeLayoutData, this.maskBuffer, this.solidsBuffer, this.scratchBuffer, this.spriteGpuBuffer);
 
     // Markings
     this.markingsDataCpu = createMarkings(config, this.maskData, markingLayout);
@@ -189,7 +203,7 @@ export class Scene {
 
     // Renderers & cross-section
     this.renderer = new Renderer(device, format, config, this.simulation, this.markingsBuffer, this.maskBuffer, this.scratchBuffer);
-    this.isoRenderer = new IsometricRenderer(device, format, config, this.simulation, this.markingsBuffer, this.envMap.buffer, this.maskBuffer, this.solidsBuffer);
+    this.isoRenderer = new IsometricRenderer(device, format, config, this.simulation, this.markingsBuffer, this.envMap.buffer, this.maskBuffer, this.solidsBuffer, this.scratchBuffer);
     this.crossSection = new CrossSection(device, format, config, this.simulation, this.markingsBuffer);
 
     // Game systems
@@ -295,6 +309,31 @@ export class Scene {
       }
     }
 
+    // Crowd density: ramp toward target based on event type
+    if (this.scheduler.autoMode && !paused && this.config.isIndoor) {
+      const evt = this.scheduler.currentEvent;
+      switch (evt.type) {
+        case 'hockey_practice': this._crowdTarget = evt.name.includes('Game') ? 0.9 : 0.7; break;
+        case 'figure_skating': this._crowdTarget = 0.5; break;
+        case 'public_skate': this._crowdTarget = 0.4; break;
+        case 'maintenance': this._crowdTarget = 0.05; break;
+        case 'idle': this._crowdTarget = 0; break;
+      }
+      // Smooth ramp: 30-min ramp up (1800s), 15-min ramp down (900s)
+      const rampSpeed = this.crowdDensity < this._crowdTarget ? simSecsPerFrame / 1800 : simSecsPerFrame / 900;
+      if (Math.abs(this.crowdDensity - this._crowdTarget) < rampSpeed) {
+        this.crowdDensity = this._crowdTarget;
+      } else if (this.crowdDensity < this._crowdTarget) {
+        this.crowdDensity += rampSpeed;
+      } else {
+        this.crowdDensity -= rampSpeed;
+      }
+      this.crowdDensity = Math.max(0, Math.min(1, this.crowdDensity));
+    } else if (!this.scheduler.autoMode) {
+      this.crowdDensity = 0;
+      this._crowdTarget = 0;
+    }
+
     const encoder = this.device.createCommandEncoder();
     const zp = this.zamboni.getParams();
 
@@ -374,22 +413,7 @@ export class Scene {
         // 'auto' when !weatherAuto: undefined → uses default in writeParams
       }
 
-      // Skater surface damage: apply tiny scratches at random skater positions
-      if (!firstDamage && this.skaterSim.count > 0) {
-        const pos = this.skaterSim.getRandomPosition();
-        if (pos) {
-          firstDamage = {
-            active: true,
-            gridX: pos.x,
-            gridY: pos.y,
-            radius: 2,
-            mode: 1,
-            amount: 0.02,
-            velocityX: Math.cos(pos.dir) * 3,
-            velocityY: Math.sin(pos.dir) * 3,
-          };
-        }
-      }
+      // Skater surface damage: handled GPU-side in heat.wgsl via sprite buffer (binding 9)
 
       // One-shot events
       const hasOneShot = this.pendingFlood > 0 || this.pendingSnow > 0 || firstDamage !== damageInput;
@@ -498,6 +522,8 @@ export class Scene {
     const spriteData = this.spriteBuffer.getBuffer();
     this.renderer.updateSprites(spriteData);
     this.isoRenderer.updateSprites(spriteData);
+    // Update compute shader sprite buffer (for GPU-side skater damage/snow interaction)
+    this.device.queue.writeBuffer(this.spriteGpuBuffer, 0, spriteData);
 
     // Time of day
     let timeOfDay: number;
@@ -520,7 +546,8 @@ export class Scene {
 
     // In skybox mode (3D view), override sun/sky with HDRI-matched lighting
     // so the directional lighting matches the sky dome photograph
-    const envPreset = EnvironmentMap.presetForTime(timeOfDay, cloudCover);
+    // Indoor arenas always use 'clear' HDRI — they have their own lights, time shouldn't affect them
+    const envPreset = this.config.isIndoor ? 'clear' as const : EnvironmentMap.presetForTime(timeOfDay, cloudCover);
     const useSkyboxLighting = inputs.skyMode === 'skybox' && inputs.renderMode === 3;
     let sunDir = atmosphere.sunDir;
     let sunColor = atmosphere.sunColor;
@@ -569,10 +596,14 @@ export class Scene {
       moonDir: atmosphere.moonDir,
       moonPhase: atmosphere.moonPhase,
       renderFlags: inputs.renderFlags,
-      exposure: inputs.exposure,
+      exposure: inputs.exposure * this.computeAutoExposure(skyBrightness, sunColor, skyColor, timeOfDay, cloudCover),
+      contrast: inputs.contrast,
+      saturation: inputs.saturation,
       skyMode: inputs.skyMode,
       groundType: GROUND_TYPE_MAP[this.config.surfaceGroundType],
       surroundGroundType: GROUND_TYPE_MAP[this.config.groundType],
+      hdSurface: inputs.hdSurface,
+      crowdDensity: this.crowdDensity,
     };
 
     this.renderOpts = renderOpts;
@@ -780,6 +811,32 @@ export class Scene {
     };
   }
 
+  /** Compute auto-exposure so slider=0 looks correct across all conditions. */
+  private computeAutoExposure(
+    skyBrightness: number, sunColor: number[], skyColor: number[],
+    _timeOfDay: number, cloudCover: number,
+  ): number {
+    if (this.config.isIndoor) {
+      // Indoor: skyBrightness drives arena light panel intensity (panels = brightness*2.0)
+      // Full event (~1.0) → 0.30, maintenance (~0.3) → 1.0, off (~0.1) → 3.0
+      return 0.30 / Math.max(skyBrightness, 0.05);
+    }
+
+    // Outdoor: single formula driven by sun + sky luminance
+    const sunLum = sunColor[0] * 0.2126 + sunColor[1] * 0.7152 + sunColor[2] * 0.0722;
+    const skyLum = skyColor[0] * 0.2126 + skyColor[1] * 0.7152 + skyColor[2] * 0.0722;
+
+    // Combined scene estimate — sky weighted heavier so twilight/overcast stay balanced
+    const sceneLum = sunLum * 0.25 + skyLum * 0.20;
+
+    // Clouds dim direct sun, compensate slightly
+    const cloudDim = 1.0 + cloudCover * 0.2;
+
+    // Simple inverse, capped so night stays dark (no artificial lights = dark rink)
+    const auto = 0.15 / Math.max(sceneLum + 0.06, 0.06);
+    return Math.min(auto * cloudDim, 2.0);
+  }
+
   /** Destroy all GPU resources. */
   dispose() {
     this.simulation.destroy();
@@ -791,5 +848,6 @@ export class Scene {
     this.markingsBuffer.destroy();
     this.solidsBuffer.destroy();
     this.scratchBuffer.destroy();
+    this.spriteGpuBuffer.destroy();
   }
 }

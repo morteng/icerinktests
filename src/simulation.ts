@@ -145,6 +145,7 @@ export class Simulation {
 
   private pipeline: GPUComputePipeline;
   private bindGroups: [GPUBindGroup, GPUBindGroup];
+  private ownedSpriteBuffer: GPUBuffer | null = null; // only if we created a dummy
 
   private current = 0;
   private workgroupsX: number;
@@ -159,6 +160,7 @@ export class Simulation {
     maskBuffer: GPUBuffer,
     solidsBuffer: GPUBuffer,
     scratchBuffer: GPUBuffer,
+    spriteBuffer?: GPUBuffer,
   ) {
     this.device = device;
     this.gridW = config.gridW;
@@ -196,6 +198,17 @@ export class Simulation {
     this.readbackBuffer = device.createBuffer({ size: stateSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.readbackBuffer2 = device.createBuffer({ size: stateSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
+    // Sprite buffer for GPU-side skater interaction (damage, snow tracks)
+    let spriteBuf = spriteBuffer;
+    if (!spriteBuf) {
+      // Create a minimal dummy sprite buffer (header only, zero sprites)
+      spriteBuf = device.createBuffer({
+        size: 16 + 64 * 32, // header + max sprites
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      this.ownedSpriteBuffer = spriteBuf;
+    }
+
     const module = device.createShaderModule({ code: heatShaderCode });
     this.pipeline = device.createComputePipeline({
       layout: 'auto',
@@ -216,6 +229,7 @@ export class Simulation {
           { binding: 6, resource: { buffer: scratchBuffer } },
           { binding: 7, resource: { buffer: this.state2Buffers[0] } },
           { binding: 8, resource: { buffer: this.state2Buffers[1] } },
+          { binding: 9, resource: { buffer: spriteBuf } },
         ],
       }),
       device.createBindGroup({
@@ -230,6 +244,7 @@ export class Simulation {
           { binding: 6, resource: { buffer: scratchBuffer } },
           { binding: 7, resource: { buffer: this.state2Buffers[1] } },
           { binding: 8, resource: { buffer: this.state2Buffers[0] } },
+          { binding: 9, resource: { buffer: spriteBuf } },
         ],
       }),
     ];
@@ -421,5 +436,6 @@ export class Simulation {
     this.paramsBuffer.destroy();
     this.readbackBuffer.destroy();
     this.readbackBuffer2.destroy();
+    this.ownedSpriteBuffer?.destroy();
   }
 }

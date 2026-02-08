@@ -30,6 +30,11 @@ fn sprite_billboard_size(sp: Sprite, st: u32) -> vec2f {
       return vec2f(max(sp.width, 8.0), 1.8 / cell_m);
     }
     default: {
+      // Custom sprite types 9-16: default to skater-like size
+      if (st >= 9u && st <= 16u) {
+        let hs2 = select(sp.height, 1.0, sp.height < 0.01);
+        return vec2f(0.6 / cell_m, 1.8 * hs2 / cell_m);
+      }
       return vec2f(1.0, 1.0);
     }
   }
@@ -579,12 +584,14 @@ const PARALLAX_STEPS: i32 = 12;
 const PARALLAX_REFINE_STEPS: i32 = 4;
 
 // Sample height from the height atlas at given atlas UV
+// Atlas channels: R=height, G=normal.x, B=normal.y (normals read separately)
 fn sample_height_at_atlas_uv(atlas_uv: vec2f) -> f32 {
   let h = textureSampleLevel(sprite_height_atlas, sprite_sampler, atlas_uv, 0.0);
-  return h.r; // height normalized 0-1 (from R channel)
+  return h.r; // height normalized 0-1 (from R channel only)
 }
 
 // Compute atlas UV for a given local sprite UV, sprite, and type
+// Uses per-row pixel offsets and span sizes for multi-cell sprite support
 fn compute_atlas_uv(uv: vec2f, sp: Sprite, st: u32) -> vec2f {
   let team = sprite_team(sp);
   let row = sprite_atlas_row(st, team);
@@ -592,10 +599,17 @@ fn compute_atlas_uv(uv: vec2f, sp: Sprite, st: u32) -> vec2f {
   let frame = u32(floor(sp.aux0 * f32(ATLAS_FRAME_COUNT))) % ATLAS_FRAME_COUNT;
   let col = dir_idx * ATLAS_FRAME_COUNT + frame;
 
-  return vec2f(
-    (f32(col) + clamp(uv.x, 0.001, 0.999)) / f32(ATLAS_COLS),
-    (f32(row) + 1.0 - clamp(uv.y, 0.001, 0.999)) / f32(ATLAS_ROWS)
-  );
+  // Per-row frame pixel dimensions
+  let span_w = f32(ROW_SPAN_W[row]);
+  let span_h = f32(ROW_SPAN_H[row]);
+  let frame_px_w = span_w * BASE_CELL_W;
+  let frame_px_h = span_h * BASE_CELL_H;
+
+  // Pixel position of this frame in the atlas
+  let px_x = f32(col) * COL_SLOT_W + clamp(uv.x, 0.001, 0.999) * frame_px_w;
+  let px_y = ROW_Y_PX[row] + (1.0 - clamp(uv.y, 0.001, 0.999)) * frame_px_h;
+
+  return vec2f(px_x / ATLAS_PX_W, px_y / ATLAS_PX_H);
 }
 
 // Sample height at local sprite UV
@@ -604,20 +618,36 @@ fn sample_sprite_height(uv: vec2f, sp: Sprite, st: u32) -> f32 {
   return sample_height_at_atlas_uv(atlas_uv);
 }
 
-// Compute normal from height gradient using finite differences
+// Read normal from height atlas G/B channels (pre-computed Sobel normals)
+// Falls back to finite differences if normal is zero (backward compat for custom sprites)
 fn sprite_height_normal(uv: vec2f, sp: Sprite, st: u32) -> vec3f {
-  let eps = vec2f(1.0 / 32.0, 1.0 / 48.0); // one texel in sprite space
+  let atlas_uv = compute_atlas_uv(uv, sp, st);
+  let sample = textureSampleLevel(sprite_height_atlas, sprite_sampler, atlas_uv, 0.0);
+
+  // Decode normals from G/B: nx = (g - 0.5) * 2.0, ny = (b - 0.5) * 2.0
+  let nx = (sample.g - 0.5) * 2.0;
+  let ny = (sample.b - 0.5) * 2.0;
+
+  // Check if normal data is present (non-neutral G/B)
+  if (abs(nx) > 0.01 || abs(ny) > 0.01) {
+    let nz = sqrt(max(0.0, 1.0 - nx * nx - ny * ny));
+    return normalize(vec3f(nx, ny, nz));
+  }
+
+  // Fallback: finite differences for custom sprites without encoded normals
+  let team = sprite_team(sp);
+  let row = sprite_atlas_row(st, team);
+  let frame_px_w = f32(ROW_SPAN_W[row]) * BASE_CELL_W;
+  let frame_px_h = f32(ROW_SPAN_H[row]) * BASE_CELL_H;
+  let eps = vec2f(1.0 / frame_px_w, 1.0 / frame_px_h);
 
   let h_xp = sample_sprite_height(uv + vec2f(eps.x, 0.0), sp, st);
   let h_xn = sample_sprite_height(uv - vec2f(eps.x, 0.0), sp, st);
   let h_yp = sample_sprite_height(uv + vec2f(0.0, eps.y), sp, st);
   let h_yn = sample_sprite_height(uv - vec2f(0.0, eps.y), sp, st);
 
-  // Gradient in UV space, scaled to world-space height
   let dhdx = (h_xp - h_xn) * 0.5;
   let dhdy = (h_yp - h_yn) * 0.5;
-
-  // Normal in tangent space (UV-aligned: X=u, Y=v, Z=outward)
   return normalize(vec3f(-dhdx * 3.0, -dhdy * 3.0, 1.0));
 }
 
@@ -659,8 +689,78 @@ fn parallax_sprite(uv: vec2f, view_dir_ts: vec2f, sp: Sprite, st: u32) -> vec2f 
   return cur_uv;
 }
 
+// Parallax self-shadow: march from surface point along light direction through height field
+// Returns shadow factor (0.3 = fully shadowed, 1.0 = fully lit)
+fn parallax_self_shadow(uv: vec2f, light_dir_ts: vec2f, sp: Sprite, st: u32) -> f32 {
+  let steps = 6;
+  let step_size = 1.0 / f32(steps);
+  let cur_height = sample_sprite_height(uv, sp, st);
+
+  // March along light direction in UV space
+  let delta_uv = light_dir_ts * PARALLAX_SCALE * step_size;
+  var max_depth_under: f32 = 0.0;
+  var march_uv = uv;
+  var march_h = cur_height;
+
+  for (var i = 1; i <= steps; i++) {
+    march_uv += delta_uv;
+    march_h -= step_size; // expected height decreasing along ray
+
+    // Bounds check
+    if (march_uv.x < 0.0 || march_uv.x > 1.0 || march_uv.y < 0.0 || march_uv.y > 1.0) { break; }
+
+    let h = sample_sprite_height(march_uv, sp, st);
+    let depth_under = h - (cur_height - f32(i) * step_size * cur_height);
+    max_depth_under = max(max_depth_under, depth_under);
+  }
+
+  // Soft shadow: blend based on how deep under the height field
+  if (max_depth_under > 0.01) {
+    let shadow_strength = clamp(max_depth_under * 8.0, 0.0, 1.0);
+    return mix(1.0, 0.3, shadow_strength);
+  }
+  return 1.0;
+}
+
+// Ambient occlusion from height field — samples ring around pixel
+fn sprite_ao(uv: vec2f, sp: Sprite, st: u32) -> f32 {
+  let center_h = sample_sprite_height(uv, sp, st);
+  let team = sprite_team(sp);
+  let row = sprite_atlas_row(st, team);
+  let frame_px_w = f32(ROW_SPAN_W[row]) * BASE_CELL_W;
+  let frame_px_h = f32(ROW_SPAN_H[row]) * BASE_CELL_H;
+  // Sample radius: ~3 texels
+  let r = vec2f(3.0 / frame_px_w, 3.0 / frame_px_h);
+
+  // 8 samples in a ring
+  var total_diff: f32 = 0.0;
+  var count: f32 = 0.0;
+  let offsets = array<vec2f, 8>(
+    vec2f(1.0, 0.0), vec2f(-1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, -1.0),
+    vec2f(0.707, 0.707), vec2f(-0.707, 0.707), vec2f(0.707, -0.707), vec2f(-0.707, -0.707)
+  );
+
+  for (var i = 0; i < 8; i++) {
+    let sample_uv = uv + offsets[i] * r;
+    if (sample_uv.x >= 0.0 && sample_uv.x <= 1.0 && sample_uv.y >= 0.0 && sample_uv.y <= 1.0) {
+      let h = sample_sprite_height(sample_uv, sp, st);
+      total_diff += max(0.0, h - center_h); // how much higher the surrounding is
+      count += 1.0;
+    }
+  }
+
+  // Cavities (center lower than surroundings) get darkened
+  if (count > 0.0) {
+    let avg_diff = total_diff / count;
+    let ao = 1.0 - clamp(avg_diff * 6.0, 0.0, 0.5);
+    return ao;
+  }
+  return 1.0;
+}
+
 // Sprite lighting using per-pixel normal from height map
-fn sprite_light_with_normal(world_pos: vec3f, base_color: vec3f, N_tangent: vec3f, billboard_right: vec3f) -> vec3f {
+// self_shadow: parallax self-shadow factor (0.3-1.0), ao: ambient occlusion (0.5-1.0)
+fn sprite_light_with_normal(world_pos: vec3f, base_color: vec3f, N_tangent: vec3f, billboard_right: vec3f, self_shadow: f32, ao: f32) -> vec3f {
   let is_outdoor = (params.flags & 1u) != 0u;
   let billboard_up = vec3f(0.0, 1.0, 0.0);
   let billboard_fwd = normalize(cross(billboard_up, billboard_right));
@@ -679,7 +779,8 @@ fn sprite_light_with_normal(world_pos: vec3f, base_color: vec3f, N_tangent: vec3
   let sun_ndotl = max(dot(N_world, sun_dir), 0.0);
   let sun_half = sun_ndotl * 0.5 + 0.5;
   let terrain_sun_shadow = shadow_for_sun(world_pos, sun_dir);
-  var diffuse = params.sun_color * sun_half * 0.7 * terrain_sun_shadow;
+  // Apply self-shadow to sun contribution
+  var diffuse = params.sun_color * sun_half * 0.7 * terrain_sun_shadow * self_shadow;
 
   let light_count = min(params.light_count, MAX_LIGHTS);
   for (var i = 0u; i < light_count; i++) {
@@ -704,16 +805,27 @@ fn sprite_light_with_normal(world_pos: vec3f, base_color: vec3f, N_tangent: vec3
     is_outdoor
   );
 
-  var result = base_color * (ambient + diffuse);
+  // Apply AO to ambient lighting
+  var result = base_color * (ambient * ao + diffuse);
   result *= params.exposure;
-  result = aces_tonemap(result);
+  result = agx_tonemap(result);
   return result;
 }
 
-// ---- Sprite atlas sampling ----
-const ATLAS_COLS: u32 = 32u;   // 8 dirs × 4 frames
-const ATLAS_ROWS: u32 = 8u;
+// ---- Sprite atlas sampling (multi-cell span support) ----
+const ATLAS_PX_W: f32 = 2048.0; // 32 cols × 2 × 32px
+const ATLAS_PX_H: f32 = 864.0;  // sum of per-row heights
+const BASE_CELL_W: f32 = 32.0;
+const BASE_CELL_H: f32 = 48.0;
+const COL_SLOT_W: f32 = 64.0;   // MAX_SPAN_W(2) × BASE_CELL_W(32)
 const ATLAS_FRAME_COUNT: u32 = 4u;
+
+// Per-row span widths in base cells (1 or 2)
+const ROW_SPAN_W = array<u32, 16>(1u, 1u, 1u, 1u, 2u, 1u, 2u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u);
+// Per-row span heights in base cells (1 or 2)
+const ROW_SPAN_H = array<u32, 16>(1u, 1u, 1u, 1u, 2u, 1u, 2u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u);
+// Per-row Y pixel offsets into atlas
+const ROW_Y_PX = array<f32, 16>(0.0, 48.0, 96.0, 144.0, 192.0, 288.0, 336.0, 432.0, 480.0, 528.0, 576.0, 624.0, 672.0, 720.0, 768.0, 816.0);
 
 fn sprite_atlas_row(st: u32, team: u32) -> u32 {
   switch st {
@@ -724,7 +836,11 @@ fn sprite_atlas_row(st: u32, team: u32) -> u32 {
     case 5u: { return 5u; } // shovel
     case 6u, 7u: { return 7u; } // goal
     case 8u: { return 6u; } // water tank
-    default: { return 0u; }
+    default: {
+      // Custom sprite types 9-16 map to atlas rows 8-15
+      if (st >= 9u && st <= 16u) { return st - 1u; }
+      return 0u;
+    }
   }
 }
 
@@ -858,18 +974,87 @@ fn sprite_silhouette(uv: vec2f, st: u32) -> bool {
 
 fn sprite_cast_shadow(world_pos: vec3f, light_dir: vec3f) -> f32 {
   let count = min(sprite_count(), MAX_SPRITES);
+  var best = 1.0;
 
   for (var i = 0u; i < count; i++) {
     let sp = read_sprite(i);
     let st = sprite_type(sp);
     if (st == SPRITE_NONE) { continue; }
 
+    // Method 1: ray-billboard intersection (pixel-accurate shadow shape)
     let hit = ray_billboard_intersect(world_pos, light_dir, sp, st);
-    if (hit.w > 0.5 && sprite_silhouette(hit.xy, st)) {
-      return 0.35;
+    if (hit.w > 0.5) {
+      let atlas_uv = compute_atlas_uv(hit.xy, sp, st);
+      let alpha = textureSampleLevel(sprite_atlas, sprite_sampler, atlas_uv, 0.0).a;
+      if (alpha > 0.1) {
+        best = min(best, 0.30);
+        continue;
+      }
+      if (sprite_silhouette(hit.xy, st)) {
+        best = min(best, 0.40);
+        continue;
+      }
+    }
+
+    // Method 2: geometric ground-projected shadow (fallback, always works)
+    // Projects sprite as shadow ellipse on the ground along sun direction
+    if (light_dir.y > 0.05) {
+      let size = sprite_billboard_size(sp, st);
+      let half_h = size.y * 0.5;
+      // Shadow center: project from sprite mid-height onto ground along -sun
+      let proj_x = sp.x - (light_dir.x / light_dir.y) * half_h;
+      let proj_z = sp.y - (light_dir.z / light_dir.y) * half_h;
+      let dx = world_pos.x - proj_x;
+      let dz = world_pos.z - proj_z;
+      // Ellipse: width = sprite width, length = projected height
+      let shadow_w = max(size.x * 0.35, 2.0);
+      let shadow_len = max(half_h / light_dir.y * 0.3, 3.0);
+      // Rotate ellipse axes along shadow direction
+      let sun_xz = normalize(vec2f(light_dir.x, light_dir.z));
+      let along = dx * sun_xz.x + dz * sun_xz.y; // distance along shadow
+      let perp = -dx * sun_xz.y + dz * sun_xz.x;  // perpendicular distance
+      let norm_dist = (along * along) / (shadow_len * shadow_len) + (perp * perp) / (shadow_w * shadow_w);
+      if (norm_dist < 1.0) {
+        let f = 1.0 - norm_dist;
+        best = min(best, 1.0 - f * f * 0.30);
+      }
     }
   }
-  return 1.0;
+  return best;
+}
+
+// Contact shadow: subtle ambient occlusion under each sprite at ice level
+// Grounds sprites visually — small, soft darkening right at feet
+fn sprite_contact_shadow(world_pos: vec3f) -> f32 {
+  let count = min(sprite_count(), MAX_SPRITES);
+  var shadow = 0.0;
+  let cell_m = params.cell_size;
+
+  for (var i = 0u; i < count; i++) {
+    let sp = read_sprite(i);
+    let st = sprite_type(sp);
+    if (st == SPRITE_NONE || st == SPRITE_GOAL_LEFT || st == SPRITE_GOAL_RIGHT) { continue; }
+
+    let dx = world_pos.x - sp.x;
+    let dz = world_pos.z - sp.y;
+    let dist_sq = dx * dx + dz * dz;
+
+    // Subtle contact shadow: ~0.15m radius for skaters, larger for vehicles
+    var radius_m: f32 = 0.15;
+    var strength: f32 = 0.30;
+    if (st == SPRITE_ZAMBONI) { radius_m = 1.5; }
+    else if (st == SPRITE_WATER_TANK) { radius_m = 1.0; }
+    else if (st == SPRITE_SHOVEL) { radius_m = 0.2; }
+
+    let radius = radius_m / cell_m;
+    let r2 = radius * radius;
+
+    if (dist_sq < r2) {
+      let t = 1.0 - dist_sq / r2;
+      shadow = max(shadow, t * t * strength);
+    }
+  }
+  return 1.0 - shadow;
 }
 
 fn sprite_ice_reflection(world_pos: vec3f, R: vec3f, ice_mm: f32) -> vec4f {
@@ -946,7 +1131,7 @@ fn sprite_light_3d(world_pos: vec3f, base_color: vec3f) -> vec3f {
 
   var result = base_color * (ambient + diffuse);
   result *= params.exposure;
-  result = aces_tonemap(result);
+  result = agx_tonemap(result);
   return result;
 }
 
@@ -959,12 +1144,14 @@ fn fs_sprite(in: SpriteVSOut) -> @location(0) vec4f {
   let st = sprite_type(sp);
   if (st == SPRITE_NONE) { discard; }
 
-  // Check if this sprite has height data (skaters, vehicles, goals)
-  let has_height = st >= 1u && st <= 8u;
+  // Check if this sprite has height data (skaters, vehicles, goals, custom)
+  let has_height = st >= 1u && st <= 16u;
 
   var uv = in.local_uv;
   var use_normal_lighting = false;
   var N_tangent = vec3f(0.0, 0.0, 1.0);
+  var self_shadow: f32 = 1.0;
+  var ao: f32 = 1.0;
 
   if (has_height) {
     // Compute view direction in tangent space for parallax
@@ -976,8 +1163,6 @@ fn fs_sprite(in: SpriteVSOut) -> @location(0) vec4f {
     // Project view direction onto billboard tangent plane
     let view_u = dot(view_world, right);
     let view_v = dot(view_world, up);
-    // view_dir_ts: how view ray projects into UV offset
-    // We want the 2D direction to shift UVs
     let view_dir_ts = vec2f(view_u, view_v);
 
     // Apply parallax mapping
@@ -986,9 +1171,29 @@ fn fs_sprite(in: SpriteVSOut) -> @location(0) vec4f {
     // Bounds check — discard if parallax pushed UV out of sprite
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { discard; }
 
-    // Compute per-pixel normal from height gradient
+    // Silhouette clipping: discard pixels with near-zero height
+    // Use very low threshold to keep sprite feet/skate blades visible
+    let surface_h = sample_sprite_height(uv, sp, st);
+    if (surface_h < 0.005) { discard; }
+
+    // Compute per-pixel normal from height atlas (single sample, pre-computed Sobel)
     N_tangent = sprite_height_normal(uv, sp, st);
     use_normal_lighting = true;
+
+    // Self-shadow: march from surface point along sun direction through height field
+    let raw_sun = params.sun_dir;
+    let sun_len = length(raw_sun);
+    if (sun_len > 0.001) {
+      let sun_dir = raw_sun / sun_len;
+      // Project sun direction into tangent space
+      let sun_u = dot(sun_dir, right);
+      let sun_v = dot(sun_dir, up);
+      let light_dir_ts = vec2f(sun_u, sun_v);
+      self_shadow = parallax_self_shadow(uv, light_dir_ts, sp, st);
+    }
+
+    // Ambient occlusion from height field
+    ao = sprite_ao(uv, sp, st);
   }
 
   let pixel = sample_sprite_color(uv, sp, st);
@@ -996,7 +1201,7 @@ fn fs_sprite(in: SpriteVSOut) -> @location(0) vec4f {
 
   var lit: vec3f;
   if (use_normal_lighting) {
-    lit = sprite_light_with_normal(in.world_pos, pixel.rgb, N_tangent, camera.billboard_right);
+    lit = sprite_light_with_normal(in.world_pos, pixel.rgb, N_tangent, camera.billboard_right, self_shadow, ao);
   } else {
     lit = sprite_light_3d(in.world_pos, pixel.rgb);
   }

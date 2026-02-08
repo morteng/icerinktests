@@ -443,7 +443,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
       draw_light_fixtures(&color, f32(px) + 0.5, f32(py) + 0.5);
 
       draw_crosshair(&color, px, py);
-      color = aces_tonemap(color);
+      color = agx_tonemap(color);
       return vec4f(color, 1.0);
     }
 
@@ -851,7 +851,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     // Cross-section crosshair
     draw_crosshair(&color, px, py);
 
-    color = aces_tonemap(color);
+    color = agx_tonemap(color);
     return vec4f(color, 1.0);
   }
 }

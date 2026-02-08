@@ -105,6 +105,14 @@ export class SpriteBuffer {
     this.writeSprite(slot, x, y, dir, packInfo(type, team), width, heightScale, phase, seed);
   }
 
+  /** Place a custom sprite at any slot (for debug/injection). */
+  setCustom(slot: number, x: number, y: number, dir: number,
+    type: number, team: number = 0, width: number = 0,
+    heightScale: number = 1.0, phase: number = 0, seed: number = 0.5) {
+    this.writeSprite(slot, x, y, dir, packInfo(type as SpriteType, team),
+      width, heightScale, phase, seed);
+  }
+
   /** Write the active sprite count into the header. */
   setCount(count: number) {
     this.u32[0] = count;

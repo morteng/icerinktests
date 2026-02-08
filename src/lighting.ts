@@ -280,7 +280,8 @@ function buildIndoorLighting(
   } else if (evt) {
     level = 'full';
   } else {
-    level = (tod >= 6 && tod <= 22) ? 'full' : 'dim';
+    // Indoor arenas have their own lights — always full when no event is driving it
+    level = 'full';
   }
 
   const int = level === 'full' ? 1.0 : level === 'medium' ? 0.6 : 0.12;
@@ -352,48 +353,52 @@ function buildOutdoorLighting(
     const isBackyardMedium = preset === 'backyard_medium';
 
     if (isBackyardSmall) {
-      // 2 lampposts at opposite corners
-      const postH = 12; // low garden lamppost
-      const reach = Math.max(hx, hy) * 2.0;
+      // Small backyard: 4 flood lights (house-mounted + garden post style)
+      const postH = 15;
+      const reach = Math.max(hx, hy) * 2.5;
+      const m = 4;
       lights.push(
-        { x: cx - hx - 3, y: cy - hy - 3, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.7, radius: reach },
-        { x: cx + hx + 3, y: cy + hy + 3, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.7, radius: reach },
+        // Two house-side floods (warm LED, slightly higher)
+        { x: cx - hx * 0.5, y: cy - hy - m, z: postH + 3, r: 1.0, g: 0.95, b: 0.82, intensity: fi * 1.2, radius: reach },
+        { x: cx + hx * 0.5, y: cy - hy - m, z: postH + 3, r: 1.0, g: 0.95, b: 0.82, intensity: fi * 1.2, radius: reach },
+        // Two garden posts on the far side
+        { x: cx - hx * 0.4, y: cy + hy + m, z: postH, r: 1.0, g: 0.93, b: 0.78, intensity: fi * 1.0, radius: reach },
+        { x: cx + hx * 0.4, y: cy + hy + m, z: postH, r: 1.0, g: 0.93, b: 0.78, intensity: fi * 1.0, radius: reach },
       );
     } else if (isBackyardMedium) {
-      // 6 lampposts around the perimeter
-      const postH = 15;
-      const reach = Math.max(hx, hy) * 1.5;
-      const margin = 4;
-      // 2 on each long side + 1 on each short side
+      // Medium backyard: 6 LED flood lights on posts around the rink
+      const postH = 18;
+      const reach = Math.max(hx, hy) * 2.0;
+      const margin = 5;
       lights.push(
-        // Long sides (top and bottom)
-        { x: cx - hx * 0.4, y: cy - hy - margin, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.6, radius: reach },
-        { x: cx + hx * 0.4, y: cy - hy - margin, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.6, radius: reach },
-        { x: cx - hx * 0.4, y: cy + hy + margin, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.6, radius: reach },
-        { x: cx + hx * 0.4, y: cy + hy + margin, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.6, radius: reach },
-        // Short sides (left and right)
-        { x: cx - hx - margin, y: cy, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.6, radius: reach },
-        { x: cx + hx + margin, y: cy, z: postH, r: 1.0, g: 0.92, b: 0.7, intensity: fi * 0.6, radius: reach },
+        // Long sides: 2 per side (LED floods, neutral-warm)
+        { x: cx - hx * 0.35, y: cy - hy - margin, z: postH, r: 1.0, g: 0.95, b: 0.85, intensity: fi * 1.0, radius: reach },
+        { x: cx + hx * 0.35, y: cy - hy - margin, z: postH, r: 1.0, g: 0.95, b: 0.85, intensity: fi * 1.0, radius: reach },
+        { x: cx - hx * 0.35, y: cy + hy + margin, z: postH, r: 1.0, g: 0.95, b: 0.85, intensity: fi * 1.0, radius: reach },
+        { x: cx + hx * 0.35, y: cy + hy + margin, z: postH, r: 1.0, g: 0.95, b: 0.85, intensity: fi * 1.0, radius: reach },
+        // Short sides: 1 each (corner posts)
+        { x: cx - hx - margin, y: cy, z: postH, r: 1.0, g: 0.95, b: 0.85, intensity: fi * 0.9, radius: reach },
+        { x: cx + hx + margin, y: cy, z: postH, r: 1.0, g: 0.95, b: 0.85, intensity: fi * 0.9, radius: reach },
       );
     } else {
-      // Recreational: 8 tall floodlight poles around perimeter (realistic)
-      const postH = 30;
-      const reach = Math.max(hx, hy) * 2.0;
-      const mx = 6; // margin from rink edge
-      const my = 6;
+      // Recreational: 8 tall sports floodlight poles (metal halide / LED)
+      const postH = 40;
+      const reach = Math.max(hx, hy) * 2.5;
+      const mx = 8;
+      const my = 8;
       // 3 per long side + 1 per short side
       lights.push(
         // Top edge (3)
-        { x: cx - hx * 0.5, y: cy - hy - my, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
-        { x: cx,             y: cy - hy - my, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
-        { x: cx + hx * 0.5, y: cy - hy - my, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
+        { x: cx - hx * 0.45, y: cy - hy - my, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.2, radius: reach },
+        { x: cx,              y: cy - hy - my, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.2, radius: reach },
+        { x: cx + hx * 0.45, y: cy - hy - my, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.2, radius: reach },
         // Bottom edge (3)
-        { x: cx - hx * 0.5, y: cy + hy + my, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
-        { x: cx,             y: cy + hy + my, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
-        { x: cx + hx * 0.5, y: cy + hy + my, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
+        { x: cx - hx * 0.45, y: cy + hy + my, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.2, radius: reach },
+        { x: cx,              y: cy + hy + my, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.2, radius: reach },
+        { x: cx + hx * 0.45, y: cy + hy + my, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.2, radius: reach },
         // Short sides (1 each)
-        { x: cx - hx - mx, y: cy, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
-        { x: cx + hx + mx, y: cy, z: postH, r: 1.0, g: 0.97, b: 0.9, intensity: fi * 0.8, radius: reach },
+        { x: cx - hx - mx, y: cy, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.0, radius: reach },
+        { x: cx + hx + mx, y: cy, z: postH, r: 1.0, g: 0.98, b: 0.93, intensity: fi * 1.0, radius: reach },
       );
     }
 

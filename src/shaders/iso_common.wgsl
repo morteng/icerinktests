@@ -41,7 +41,16 @@ struct Params {
   exposure: f32,
   lights: array<Light, 12>,
   surround_color: vec3f,  // surround ground color (outside rink mask)
-  _pad_surr: f32,
+  contrast: f32,
+  saturation: f32,
+  rink_cx: f32,
+  rink_cy: f32,
+  rink_hx: f32,
+  rink_hy: f32,
+  rink_cr: f32,
+  goal_offset: f32,
+  crowd_density: f32,
+  _pad_arena: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;
@@ -61,6 +70,10 @@ struct Params {
 @group(0) @binding(10) var sprite_sampler: sampler;
 // Sprite height atlas for parallax relief mapping
 @group(0) @binding(11) var sprite_height_atlas: texture_2d<f32>;
+// Reflection texture (sprites rendered to offscreen, sampled for ice reflections)
+@group(0) @binding(12) var reflection_tex: texture_2d<f32>;
+// Scratch buffer: u32 per cell — bits [0:7] dir, [8:15] density, [16:23] secondary dir
+@group(0) @binding(13) var<storage, read> scratches: array<u32>;
 
 // ---- Sprite system ----
 const SPRITE_NONE = 0u;
@@ -112,10 +125,54 @@ struct VSOut {
 
 // ---- Height helpers ----
 
+fn arena_height(dist: f32) -> f32 {
+  let cell_mm = params.cell_size * 1000.0;
+  // Uniform fence height: boards + glass are same height around entire rink
+  let fence_h = 1200.0;  // ~1.2m dasher boards + glass (uniform)
+  if (dist < 4.0) {
+    // Boards + glass zone: smooth ramp from ice level to uniform fence height
+    let ramp = smoothstep(-0.5, 2.0, dist);
+    return (fence_h * ramp) / cell_mm;
+  } else if (dist < 8.0) {
+    // Concourse: flat walkway behind the glass, buffer before seats
+    let t = (dist - 4.0) / 4.0;
+    let concourse_h = 300.0;
+    let h = mix(fence_h, concourse_h, smoothstep(0.0, 0.4, t));
+    return h / cell_mm;
+  } else {
+    // Tiered seating: rises with distance — visible amphitheater steps
+    let seat_dist = dist - 8.0;
+    let row_pitch = 10.0;
+    let row_idx = floor(seat_dist / row_pitch);
+    let in_row = fract(seat_dist / row_pitch);
+    let base_h = 300.0;    // concourse level
+    let step_h = 400.0;    // each row rises 400mm — dramatic visible steps
+    // Smooth step within each row (front of row = previous level, back = next level)
+    let row_ramp = smoothstep(0.0, 0.2, in_row);
+    return (base_h + (row_idx + row_ramp) * step_h) / cell_mm;
+  }
+}
+
 fn cell_height(x: u32, y: u32) -> f32 {
   let idx = y * params.width + x;
   let s = state[idx];
   let cell_mm = params.cell_size * 1000.0;
+
+  // Indoor arena: use SDF directly (not mask) to avoid discretization jaggies at corners
+  if (is_indoor() && !is_backyard() && params.rink_hx > 0.0) {
+    let dist = rink_sdf(f32(x) + 0.5, f32(y) + 0.5);
+    if (dist >= -0.5) {
+      // Smooth blend zone: SDF -0.5..0 transitions from ice height to arena height
+      let ice_h = (s.y + s.z + s.w) / cell_mm;
+      let arena_h = arena_height(max(dist, 0.0));
+      if (dist >= 0.5) {
+        return arena_h;
+      }
+      let blend = smoothstep(-0.5, 0.5, dist);
+      return mix(ice_h, arena_h, blend);
+    }
+  }
+
   var h = (s.y + s.z + s.w) / cell_mm;
   let solid = solids[idx];
   if (solid > 2.5) {
@@ -129,6 +186,14 @@ fn cell_height_clamped(x: i32, y: i32) -> f32 {
   let cx = clamp(x, 0i, i32(params.width) - 1i);
   let cy = clamp(y, 0i, i32(params.height) - 1i);
   return cell_height(u32(cx), u32(cy));
+}
+
+// Surface height for HD normals: ice + water only (excludes noisy snow/fences)
+fn surface_height(x: u32, y: u32) -> f32 {
+  let idx = y * params.width + x;
+  let s = state[idx];
+  let cell_mm = params.cell_size * 1000.0;
+  return (s.y + s.z) / cell_mm;
 }
 
 // ---- BRDF ----
@@ -152,13 +217,45 @@ fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
   return gv * gl;
 }
 
-fn aces_tonemap(x: vec3f) -> vec3f {
-  let a = 2.51;
-  let b = 0.03;
-  let c = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
+// AgX tonemapping — Minimal implementation (Benjamin Wrensch / iolite engine)
+// Better highlight rolloff than ACES: preserves hue, no washed-out whites
+fn agx_contrast(x: vec3f) -> vec3f {
+  let x2 = x * x;
+  let x4 = x2 * x2;
+  let v = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+  return v;
+}
+
+fn agx_tonemap(val: vec3f) -> vec3f {
+  // sRGB → AgX log encoding
+  let agx_mat = mat3x3f(
+    0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+    0.0784335999999992, 0.878468636469772, 0.0784336,
+    0.0792237451477643, 0.0791661274605434, 0.879142973793104
+  );
+  // AgX log → sRGB decoding
+  let agx_mat_inv = mat3x3f(
+    1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+    -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+    -0.0990297440797205, -0.0989611768448433, 1.15107367264116
+  );
+
+  let min_ev = -12.47393;
+  let max_ev = 4.026069;
+
+  var v = agx_mat * val;
+  v = clamp(log2(max(v, vec3f(1e-10))), vec3f(min_ev), vec3f(max_ev));
+  v = (v - min_ev) / (max_ev - min_ev);
+  v = agx_contrast(v);
+
+  // Configurable look — contrast power + saturation boost from params
+  let luma = dot(v, vec3f(0.2126, 0.7152, 0.0722));
+  v = pow(v, vec3f(params.contrast));
+  v = vec3f(luma) + (v - vec3f(luma)) * params.saturation;
+
+  v = agx_mat_inv * v;
+
+  return clamp(v, vec3f(0.0), vec3f(1.0));
 }
 
 // ---- Hash / noise ----
@@ -189,4 +286,19 @@ fn cloud_density_iso(x: f32, y: f32, t: f32, cover: f32) -> f32 {
   let raw = n1 + n2;
   let threshold = 1.0 - cover * 0.7;
   return clamp((raw - threshold) / (1.0 - threshold + 0.01), 0.0, 1.0);
+}
+
+// ---- Rink SDF (same as 2D common.wgsl) ----
+fn rink_sdf(px: f32, py: f32) -> f32 {
+  let dx = max(abs(px - params.rink_cx) - params.rink_hx + params.rink_cr, 0.0);
+  let dy = max(abs(py - params.rink_cy) - params.rink_hy + params.rink_cr, 0.0);
+  return sqrt(dx * dx + dy * dy) - params.rink_cr;
+}
+
+fn is_indoor() -> bool {
+  return (params.flags & 1u) == 0u;
+}
+
+fn is_backyard() -> bool {
+  return (params.flags & 2u) != 0u;
 }

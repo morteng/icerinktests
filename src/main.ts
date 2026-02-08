@@ -9,8 +9,6 @@ import { MenuBar } from './ui/menuBar';
 import { StatsBar } from './ui/statsBar';
 import { CrossSectionUI } from './ui/crossSectionUI';
 import { IceDebug } from './debug';
-import { SpriteViewer } from './ui/spriteViewer';
-import { getOrCreateAtlas } from './spriteSheet';
 
 const CS_PANEL_WIDTH = 160;
 const SIDEBAR_WIDTH = 220;
@@ -37,7 +35,11 @@ async function main() {
     return;
   }
 
-  const device = await adapter.requestDevice();
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 10),
+    },
+  });
   device.lost.then((info) => {
     console.error('GPU device lost:', info.message);
     errorEl.textContent = `GPU device lost: ${info.message}`;
@@ -157,6 +159,9 @@ async function main() {
 
   // --- Initial build ---
   rebuildScene('backyard_small');
+  // Start with ice prepped and skaters active
+  scene().prep();
+  scene().skaterSim.spawn('public', 8);
 
   // --- Debug Console API ---
   const iceDebug = new IceDebug(sceneManager, canvas, {
@@ -166,13 +171,13 @@ async function main() {
     triggerZamboni: () => { scene().switchMachine('zamboni'); scene().zamboni.start(); },
     triggerShovel: () => { scene().switchMachine('shovel'); scene().zamboni.start(); },
     addSnow: (mm) => { scene().pendingSnow = mm; },
-  });
+  }, device, format);
   (window as any).iceDebug = iceDebug;
 
-  // --- Sprite Viewer ---
-  const spriteViewer = new SpriteViewer(getOrCreateAtlas);
-  document.body.appendChild(spriteViewer.el);
-  sidebar.onSpriteViewer = () => spriteViewer.toggle();
+  // --- Sprite Studio (opens in new tab) ---
+  sidebar.onSpriteViewer = () => {
+    window.open('sprite-studio.html', '_blank');
+  };
 
   // --- Sidebar callbacks ---
   sidebar.onPresetChange = (preset, customDims) => {
@@ -319,6 +324,14 @@ async function main() {
   sidebar.onCameraOrthoToggle = (ortho) => {
     scene().isoRenderer.camera.ortho = ortho;
   };
+  sidebar.onCameraZoom = (delta) => {
+    scene().isoRenderer.camera.zoom(delta);
+  };
+  sidebar.onCameraFit = () => {
+    const s = scene();
+    s.isoRenderer.camera.reset(s.config.gridW, s.config.gridH);
+    s.isoRenderer.camera.setPreset('oblique');
+  };
 
   sidebar.refreshSaveList(sceneManager.listSaved());
 
@@ -421,10 +434,12 @@ async function main() {
 
   canvas.addEventListener('mousedown', (e) => {
     if (sidebar.renderMode !== 3) return;
+    // Don't grab camera if a tool, paint, or light mode is active
+    const toolActive = sidebar.activeTool !== 'none' || sidebar.paintMode !== 'off' || sidebar.lightToolActive;
     const cam = scene().isoRenderer.camera;
     if (cam.locked) {
-      // Locked camera: any left-click drag = pan
-      if (e.button === 0 || e.button === 2) {
+      // Locked camera: any click = pan (but not if tool is active with left button)
+      if (e.button === 2 || (e.button === 0 && !toolActive)) {
         cameraPanMode = true;
         cameraMouseDown = true;
         lastCameraX = e.clientX;
@@ -438,8 +453,8 @@ async function main() {
       lastCameraX = e.clientX;
       lastCameraY = e.clientY;
       e.preventDefault();
-    } else if (e.button === 0 && e.altKey) {
-      // Alt+left = orbit
+    } else if (e.button === 0 && !toolActive) {
+      // Left-click = orbit (when no tool active)
       cameraMouseDown = true;
       cameraPanMode = false;
       lastCameraX = e.clientX;
@@ -473,12 +488,28 @@ async function main() {
   canvas.addEventListener('wheel', (e) => {
     if (sidebar.renderMode !== 3) return;
     e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.1 : -0.1;
+    // Scale zoom by deltaY magnitude for smooth trackpad support
+    // Clamp to avoid huge jumps from line/page scroll modes
+    const raw = e.deltaY;
+    const clamped = Math.max(-100, Math.min(100, raw));
+    const delta = clamped * 0.002; // ~0.05 per typical wheel tick
     scene().isoRenderer.camera.zoom(delta);
   }, { passive: false });
 
   canvas.addEventListener('contextmenu', (e) => {
     if (sidebar.renderMode === 3) e.preventDefault();
+  });
+
+  // --- Keyboard shortcuts ---
+  document.addEventListener('keydown', (e) => {
+    // Don't capture if user is typing in an input/select
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
+    if (e.code === 'Space') {
+      e.preventDefault();
+      sidebar.togglePause();
+    }
   });
 
   // --- FPS ---
@@ -593,7 +624,10 @@ async function main() {
       simTunables: sidebar.simTunables,
       renderFlags: sidebar.renderFlags,
       exposure: sidebar.exposure,
+      contrast: sidebar.contrast,
+      saturation: sidebar.saturation,
       skyMode: sidebar.skyMode,
+      hdSurface: sidebar.hdSurface,
     };
 
     const { timeOfDay } = s.update(inputs);

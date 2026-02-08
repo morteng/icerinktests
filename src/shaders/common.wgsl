@@ -61,6 +61,9 @@ struct RenderParams {
   surface_ground_r: f32,
   surface_ground_g: f32,
   surface_ground_b: f32,
+  // Post-processing
+  contrast: f32,
+  saturation: f32,
 }
 
 struct VSOut {

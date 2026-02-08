@@ -52,9 +52,13 @@ export interface RenderOptions {
   moonPhase: number;
   renderFlags: number;
   exposure?: number;
+  contrast?: number;
+  saturation?: number;
   skyMode?: string;  // 'physical' | 'skybox'
   groundType?: number;  // surface ground: 0=concrete, 1=grass, 2=gravel, 3=asphalt
   surroundGroundType?: number;  // surround ground type
+  hdSurface?: boolean;
+  crowdDensity?: number;  // 0.0-1.0, spectator fill for indoor arena seats
 }
 
 export class Renderer {
@@ -234,6 +238,9 @@ export class Renderer {
     f32[139] = opts.surfaceGroundColor[0];
     f32[140] = opts.surfaceGroundColor[1];
     f32[141] = opts.surfaceGroundColor[2];
+    // Post-processing
+    f32[142] = opts.contrast ?? 1.35;
+    f32[143] = opts.saturation ?? 1.4;
 
     this.device.queue.writeBuffer(this.paramsBuffer, 0, data);
 
