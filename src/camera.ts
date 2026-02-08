@@ -4,6 +4,17 @@
 
 export type CameraPreset = 'corner' | 'top' | 'front' | 'side' | 'tv' | 'oblique';
 
+export interface CameraState {
+  distance: number;
+  azimuth: number;
+  elevation: number;
+  targetX: number;
+  targetY: number;
+  targetZ: number;
+  ortho: boolean;
+  locked: boolean;
+}
+
 /** Invert a 4x4 column-major matrix using cofactor expansion.
  *  Based on the standard Mesa/GLU implementation.
  *  Returns identity if the matrix is singular. */
@@ -165,6 +176,9 @@ export class Camera {
 
   // Lock mode (no orbit, only pan+zoom)
   locked = false;
+
+  // TV camera active (disables mouse controls)
+  tvActive = false;
 
   constructor(gridW: number, gridH: number) {
     this.gridW = gridW;
@@ -408,6 +422,41 @@ export class Camera {
     const t = -this.posY / dirY;
     if (t < 0) return null;
     return [this.posX + t * dirX, this.posZ + t * dirZ];
+  }
+
+  /** Set the orbit target position. */
+  setTarget(x: number, y: number, z: number) {
+    this.targetX = x;
+    this.targetY = y;
+    this.targetZ = z;
+    this.updatePosition();
+  }
+
+  /** Get full camera state (for save/restore). */
+  getFullState(): CameraState {
+    return {
+      distance: this.distance,
+      azimuth: this.azimuth,
+      elevation: this.elevation,
+      targetX: this.targetX,
+      targetY: this.targetY,
+      targetZ: this.targetZ,
+      ortho: this.ortho,
+      locked: this.locked,
+    };
+  }
+
+  /** Restore camera state from a snapshot. */
+  setState(state: CameraState) {
+    this.distance = state.distance;
+    this.azimuth = state.azimuth;
+    this.elevation = state.elevation;
+    this.targetX = state.targetX;
+    this.targetY = state.targetY;
+    this.targetZ = state.targetZ;
+    this.ortho = state.ortho;
+    this.locked = state.locked;
+    this.updatePosition();
   }
 
   /** Get camera state for debug API. */

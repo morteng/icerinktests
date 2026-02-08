@@ -455,7 +455,7 @@ export class IsometricRenderer {
     f32[129] = opts.rinkCr;
     f32[130] = opts.goalOffset;
     f32[131] = opts.crowdDensity ?? 0.0;
-    // f32[132-135] = padding (already zero)
+    f32[132] = opts.damageVis ?? 1.0;
 
     this.device.queue.writeBuffer(this.paramsBuffer, 0, data);
 

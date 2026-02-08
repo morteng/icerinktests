@@ -544,7 +544,15 @@ fn fs_iso(in: VSOut) -> @location(0) vec4f {
     let ice_scatter = vec3f(0.6, 0.8, 0.95) * (1.0 - ice_transmittance.g) * 0.5;
     base_color = through_ice + ice_scatter;
 
-    roughness = select(0.05, 0.25, s.w > 0.02); // pristine vs scratched
+    // Damage visibility: amplify shavings effect for roughness
+    let shav_thresh = 0.02 / max(params.damage_vis, 0.01);
+    let damage_rough = 0.05 + min(s.w * params.damage_vis * 10.0, 1.0) * 0.35;
+    roughness = select(0.05, damage_rough, s.w > shav_thresh);
+    // Tint damaged areas slightly brown/grey when exaggerated
+    if (s.w > shav_thresh && params.damage_vis > 1.0) {
+      let tint_strength = min((params.damage_vis - 1.0) * 0.15, 0.4) * min(s.w * 5.0, 1.0);
+      base_color = mix(base_color, vec3f(0.7, 0.65, 0.6), tint_strength);
+    }
     f0 = 0.018;
 
     // Markings (depth-based visibility)

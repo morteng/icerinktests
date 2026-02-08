@@ -20,6 +20,7 @@ import { SpriteBuffer, SPRITE_BUFFER_SIZE } from './sprites';
 import { LightingManager, LightDef, computeAtmosphere } from './lighting';
 import { ParticleManager, LandedDeposit } from './particles';
 import { EnvironmentMap, EnvLighting } from './envMap';
+import { TVCameraController, TVContext } from './tvCamera';
 
 /** Inputs from UI → Scene each frame */
 export interface SceneInputs {
@@ -51,6 +52,7 @@ export interface SceneInputs {
   saturation: number;
   skyMode: 'physical' | 'skybox';
   hdSurface: boolean;
+  damageVis: number;
 }
 
 /** Serializable state for save/load */
@@ -104,6 +106,7 @@ export class Scene {
   interaction: InteractionManager;
   particleMgr: ParticleManager;
   envMap: EnvironmentMap;
+  tvCamera: TVCameraController;
 
   // Machine type
   machineType: MachineType;
@@ -225,6 +228,9 @@ export class Scene {
     this.spriteBuffer.setGoals(goalOff, config.gridW / 2, config.gridH / 2, rinkCellsW / 2, rinkCellsH / 2);
 
     this.lightingMgr.resetToAuto();
+
+    // TV broadcast camera
+    this.tvCamera = new TVCameraController(this.isoRenderer.camera, config.gridW, config.gridH);
   }
 
   /** Switch the active machine type (zamboni or shovel). */
@@ -519,6 +525,21 @@ export class Scene {
       this.skaterSim.update(simSecsPerFrame);
     }
     this.skaterSim.writeToSpriteBuffer(this.spriteBuffer);
+
+    // TV camera update
+    if (this.tvCamera.active && !paused) {
+      const tvContext: TVContext = {
+        zamboniActive: zp.active,
+        zamboniX: zp.x,
+        zamboniY: zp.y,
+        zamboniDir: zp.dir,
+        skaterPositions: this.skaterSim.getPositions(),
+        stateData: this.cachedStateData,
+        gridW: this.config.gridW,
+        gridH: this.config.gridH,
+      };
+      this.tvCamera.update(simSecsPerFrame, tvContext);
+    }
     const spriteData = this.spriteBuffer.getBuffer();
     this.renderer.updateSprites(spriteData);
     this.isoRenderer.updateSprites(spriteData);
@@ -604,6 +625,7 @@ export class Scene {
       surroundGroundType: GROUND_TYPE_MAP[this.config.groundType],
       hdSurface: inputs.hdSurface,
       crowdDensity: this.crowdDensity,
+      damageVis: inputs.damageVis,
     };
 
     this.renderOpts = renderOpts;

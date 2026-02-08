@@ -358,6 +358,11 @@ export class SkaterSimulation {
     }));
   }
 
+  /** Get positions of all active skaters (for TV camera tracking). */
+  getPositions(): { x: number; y: number }[] {
+    return this.skaters.filter(s => s.active).map(s => ({ x: s.x, y: s.y }));
+  }
+
   /** Get a random active skater position for surface damage. */
   getRandomPosition(): { x: number; y: number; dir: number } | null {
     const active = this.skaters.filter(s => s.active);

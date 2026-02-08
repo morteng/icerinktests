@@ -50,7 +50,7 @@ struct Params {
   rink_cr: f32,
   goal_offset: f32,
   crowd_density: f32,
-  _pad_arena: f32,
+  damage_vis: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;

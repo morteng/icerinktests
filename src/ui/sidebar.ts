@@ -93,6 +93,8 @@ export class Sidebar {
   private markingLayoutSelect!: HTMLSelectElement;
   private skyModeSelect!: HTMLSelectElement;
   private skyModeCtrl!: HTMLDivElement;
+  private tvCameraCheckbox!: HTMLInputElement;
+  private tvCameraCtrl!: HTMLDivElement;
 
   // Lights (in rendering section)
   private lightBtn!: HTMLButtonElement;
@@ -169,10 +171,12 @@ export class Sidebar {
   private sparkleCheckbox!: HTMLInputElement;
   private thinFilmCheckbox!: HTMLInputElement;
   private hdSurfaceCheckbox!: HTMLInputElement;
+  private damageVisSlider!: SliderResult;
 
   // Playback (sticky)
   private pauseBtn!: HTMLButtonElement;
   private prepBtn!: HTMLButtonElement;
+  private tvBtn!: HTMLButtonElement;
   private speedSlider!: SliderResult;
   private autoModeCheckbox!: HTMLInputElement;
 
@@ -221,7 +225,9 @@ export class Sidebar {
     this.pauseBtn = createButton('Pause');
     const resetBtn = createButton('Reset');
     this.prepBtn = createButton('Prep');
-    sticky.appendChild(createButtonRow(this.pauseBtn, resetBtn, this.prepBtn));
+    this.tvBtn = createButton('TV');
+    this.tvBtn.classList.add('active'); // on by default
+    sticky.appendChild(createButtonRow(this.pauseBtn, resetBtn, this.prepBtn, this.tvBtn));
 
     this.speedSlider = createSlider({ label: 'Speed', min: 1, max: 1000, value: 10, step: 1, formatVal: v => `${v}` });
     sticky.appendChild(this.speedSlider.row);
@@ -258,6 +264,7 @@ export class Sidebar {
     });
     resetBtn.addEventListener('click', () => this.onReset?.());
     this.prepBtn.addEventListener('click', () => this.onPrep?.());
+    this.tvBtn.addEventListener('click', () => this.toggleTvCamera());
     this.timeSlider.slider.addEventListener('input', () => {
       this.onTimeManual?.();
     });
@@ -453,6 +460,11 @@ export class Sidebar {
     const zoomFitBtn = createButton('Fit');
     this.cameraPanel.appendChild(createButtonRow(zoomInBtn, zoomOutBtn, zoomFitBtn));
 
+    const tvCam = createCheckbox('TV Camera', true);
+    this.tvCameraCheckbox = tvCam.checkbox;
+    this.tvCameraCtrl = tvCam.row;
+    this.cameraPanel.appendChild(tvCam.row);
+
     section.appendChild(this.cameraPanel);
 
     // Wire camera events
@@ -469,6 +481,9 @@ export class Sidebar {
     zoomInBtn.addEventListener('click', () => this.onCameraZoom?.(-0.15));
     zoomOutBtn.addEventListener('click', () => this.onCameraZoom?.(0.15));
     zoomFitBtn.addEventListener('click', () => this.onCameraFit?.());
+    this.tvCameraCheckbox.addEventListener('change', () => {
+      this.tvBtn.classList.toggle('active', this.tvCameraCheckbox.checked);
+    });
 
     // Sky mode (visible only in isometric/3D mode)
     const skyMode = createSelect({
@@ -603,6 +618,9 @@ export class Sidebar {
     const hdSurface = createCheckbox('HD Surface', false);
     this.hdSurfaceCheckbox = hdSurface.checkbox;
     section.appendChild(hdSurface.row);
+
+    this.damageVisSlider = createSlider({ label: 'Damage Vis', min: 0, max: 5, value: 1, step: 0.1, formatVal: v => `${v.toFixed(1)}x` });
+    section.appendChild(this.damageVisSlider.row);
 
     // Debug sub-group
     section.appendChild(createSubGroup('Debug'));
@@ -932,6 +950,8 @@ export class Sidebar {
   get skyMode(): 'physical' | 'skybox' { return this.skyModeSelect.value as 'physical' | 'skybox'; }
   get fenceEnabled(): boolean { return this.fenceCheckbox.checked; }
   get hdSurface(): boolean { return this.hdSurfaceCheckbox.checked; }
+  get tvCameraEnabled(): boolean { return this.tvCameraCheckbox.checked; }
+  get damageVis(): number { return parseFloat(this.damageVisSlider.slider.value); }
 
   get simTunables(): SimTunables {
     return {
@@ -1061,6 +1081,15 @@ export class Sidebar {
     this.pauseBtn.textContent = this._paused ? 'Play' : 'Pause';
     this.pauseBtn.classList.toggle('active', this._paused);
     this.onPauseToggle?.();
+  }
+
+  toggleTvCamera() {
+    this.tvCameraCheckbox.checked = !this.tvCameraCheckbox.checked;
+    this.tvBtn.classList.toggle('active', this.tvCameraCheckbox.checked);
+  }
+
+  setAutoMode(on: boolean) {
+    this.autoModeCheckbox.checked = on;
   }
 
   setWindDisplay(speedMs: number, dirDeg: number) {

@@ -9,6 +9,7 @@ import { MenuBar } from './ui/menuBar';
 import { StatsBar } from './ui/statsBar';
 import { CrossSectionUI } from './ui/crossSectionUI';
 import { IceDebug } from './debug';
+import { TVOverlay, CommentaryContext } from './tvOverlay';
 
 const CS_PANEL_WIDTH = 160;
 const SIDEBAR_WIDTH = 220;
@@ -81,6 +82,10 @@ async function main() {
   // Cross-section labels
   const csWrap = document.getElementById('cs-canvas-wrap')!;
   const csUI = new CrossSectionUI(csWrap, buildConfig('backyard_small'));
+
+  // --- TV Overlay ---
+  const canvasContainer = document.getElementById('canvas-container')!;
+  const tvOverlay = new TVOverlay(canvasContainer);
 
   // --- Interaction (singleton, lives for app lifetime) ---
   const interaction = new InteractionManager(canvas, buildConfig('backyard_small'));
@@ -158,10 +163,18 @@ async function main() {
   }
 
   // --- Initial build ---
-  rebuildScene('backyard_small');
-  // Start with ice prepped and skaters active
+  sidebar.setAmbientTemp(15);
+  sidebar.setPreset('olympic');
+  sidebar.setAirTauDefault(true);
+  currentLayout = 'olympic';
+  sidebar.setMarkingLayout('olympic');
+  rebuildScene('olympic');
+  // Start with ice prepped, auto mode on, practice session with skaters + crowds
   scene().prep();
-  scene().skaterSim.spawn('public', 8);
+  sidebar.setAutoMode(true);
+  scene().scheduler.autoMode = true;
+  scene().skaterSim.spawn('hockey', 12);
+  scene().crowdDensity = 0.7;
 
   // --- Debug Console API ---
   const iceDebug = new IceDebug(sceneManager, canvas, {
@@ -434,9 +447,11 @@ async function main() {
 
   canvas.addEventListener('mousedown', (e) => {
     if (sidebar.renderMode !== 3) return;
+    // Don't grab camera if TV camera is active
+    const cam = scene().isoRenderer.camera;
+    if (cam.tvActive) return;
     // Don't grab camera if a tool, paint, or light mode is active
     const toolActive = sidebar.activeTool !== 'none' || sidebar.paintMode !== 'off' || sidebar.lightToolActive;
-    const cam = scene().isoRenderer.camera;
     if (cam.locked) {
       // Locked camera: any click = pan (but not if tool is active with left button)
       if (e.button === 2 || (e.button === 0 && !toolActive)) {
@@ -487,6 +502,7 @@ async function main() {
 
   canvas.addEventListener('wheel', (e) => {
     if (sidebar.renderMode !== 3) return;
+    if (scene().isoRenderer.camera.tvActive) return;
     e.preventDefault();
     // Scale zoom by deltaY magnitude for smooth trackpad support
     // Clamp to avoid huge jumps from line/page scroll modes
@@ -509,6 +525,9 @@ async function main() {
     if (e.code === 'Space') {
       e.preventDefault();
       sidebar.togglePause();
+    }
+    if (e.code === 'KeyT') {
+      sidebar.toggleTvCamera();
     }
   });
 
@@ -578,6 +597,21 @@ async function main() {
     const realtime = s.zamboni.active || s.skaterSim.count > 0;
     const simSecsPerFrame = realtime ? (1 / 60) : sidebar.simSpeed;
 
+    // TV camera activation/deactivation
+    if (sidebar.tvCameraEnabled && realtime && sidebar.renderMode === 3 && !s.config.isBackyard) {
+      if (!s.tvCamera.active) s.tvCamera.activate();
+    } else if (s.tvCamera.active) {
+      s.tvCamera.deactivate();
+    }
+
+    // TV overlay commentary
+    {
+      let commentCtx: CommentaryContext = 'general';
+      if (s.zamboni.active) commentCtx = 'zamboni';
+      else if (s.skaterSim.count > 0) commentCtx = 'skaters';
+      tvOverlay.update(1 / 60, commentCtx, s.tvCamera.active);
+    }
+
     // Speed display
     sidebar.setSpeedDisplay(realtime);
 
@@ -628,6 +662,7 @@ async function main() {
       saturation: sidebar.saturation,
       skyMode: sidebar.skyMode,
       hdSurface: sidebar.hdSurface,
+      damageVis: sidebar.damageVis,
     };
 
     const { timeOfDay } = s.update(inputs);

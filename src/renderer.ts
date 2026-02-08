@@ -59,6 +59,7 @@ export interface RenderOptions {
   surroundGroundType?: number;  // surround ground type
   hdSurface?: boolean;
   crowdDensity?: number;  // 0.0-1.0, spectator fill for indoor arena seats
+  damageVis?: number;     // damage exaggeration multiplier (1.0 = normal)
 }
 
 export class Renderer {
