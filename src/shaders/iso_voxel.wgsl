@@ -60,34 +60,35 @@ fn vs_voxel(@builtin(vertex_index) vid: u32) -> VoxelVSOut {
   var local_pos: vec3f;
   var local_normal: vec3f;
 
+  // Winding: for each face, (cx_axis × cy_axis) must equal the outward normal
   switch face_id {
     case 0u: {
-      // Top face (Y+)
-      local_pos = vec3f(cx * half_l, half_h, cy * half_w);
+      // Top face (Y+): cx→+X, cy→-Z  ⇒  cross = +Y ✓
+      local_pos = vec3f(cx * half_l, half_h, -cy * half_w);
       local_normal = vec3f(0.0, 1.0, 0.0);
     }
     case 1u: {
-      // Bottom face (Y-)
-      local_pos = vec3f(cx * half_l, -half_h, -cy * half_w);
+      // Bottom face (Y-): cx→+X, cy→+Z  ⇒  cross = -Y ✓
+      local_pos = vec3f(cx * half_l, -half_h, cy * half_w);
       local_normal = vec3f(0.0, -1.0, 0.0);
     }
     case 2u: {
-      // Front face (X+, blade end)
-      local_pos = vec3f(half_l, cy * half_h, cx * half_w);
+      // Front face (X+, blade end): cx→-Z, cy→+Y  ⇒  cross = +X ✓
+      local_pos = vec3f(half_l, cy * half_h, -cx * half_w);
       local_normal = vec3f(1.0, 0.0, 0.0);
     }
     case 3u: {
-      // Back face (X-, water/towel end)
-      local_pos = vec3f(-half_l, cy * half_h, -cx * half_w);
+      // Back face (X-, water/towel end): cx→+Z, cy→+Y  ⇒  cross = -X ✓
+      local_pos = vec3f(-half_l, cy * half_h, cx * half_w);
       local_normal = vec3f(-1.0, 0.0, 0.0);
     }
     case 4u: {
-      // Right side (Z+)
+      // Right side (Z+): cx→+X, cy→+Y  ⇒  cross = +Z ✓
       local_pos = vec3f(cx * half_l, cy * half_h, half_w);
       local_normal = vec3f(0.0, 0.0, 1.0);
     }
     case 5u: {
-      // Left side (Z-)
+      // Left side (Z-): cx→-X, cy→+Y  ⇒  cross = -Z ✓
       local_pos = vec3f(-cx * half_l, cy * half_h, -half_w);
       local_normal = vec3f(0.0, 0.0, -1.0);
     }

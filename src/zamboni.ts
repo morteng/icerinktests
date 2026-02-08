@@ -114,9 +114,10 @@ export class Zamboni {
       this.bladeActuateTime = 0.5;
     }
 
-    // Pre-compute per-row extents, inset by half body length + margin
-    // so the entire body stays on ice (center doesn't go to the very edge)
-    const inset = Math.ceil(this.bodyLength / 2) + 2;
+    // Pre-compute per-row extents, inset by the larger of body half-length
+    // or turn radius + margin, so the entire body stays on ice during both
+    // straight passes and U-turns
+    const inset = Math.ceil(Math.max(this.bodyLength / 2, this.sweepOffset / 2)) + 2;
     for (let y = 0; y < config.gridH; y++) {
       let left = config.gridW, right = -1;
       for (let x = 0; x < config.gridW; x++) {
@@ -347,14 +348,10 @@ export class Zamboni {
           this.transitionTo('blade_down');
         } else {
           // Interpolate position on semicircular arc
-          // Start angle depends on current direction:
-          // dir=+1 (was going right): arc goes from 3PI/2 (bottom) to PI/2 (top), sweeping through 0 (right)
-          // Wait — we need to go from current position in a U-turn to the next row.
-          // If dir=+1, we were going right. We're at the right end.
-          // The arc should curve up (toward next row in +Y) and come back going left.
-          // Arc center is at (x, y + radius). Start at bottom of circle (angle = -PI/2 from center).
-          // End at top (angle = +PI/2). Heading rotates from 0 to PI.
-          const startAngleOnCircle = this.dir > 0 ? -Math.PI / 2 : Math.PI / 2;
+          // Arc center is at (x, y + radius). Start is always at bottom of circle (-PI/2).
+          // dir=+1 (going right): sweep counterclockwise (-PI/2 → +PI/2), heading 0→PI
+          // dir=-1 (going left): sweep clockwise (-PI/2 → -3PI/2), heading PI→0 (2PI)
+          const startAngleOnCircle = -Math.PI / 2;
           const turnDirection = this.dir > 0 ? 1 : -1;
           const currentAngleOnCircle = startAngleOnCircle + turnDirection * this.arcAngle;
 

@@ -169,10 +169,12 @@ async function main() {
   currentLayout = 'olympic';
   sidebar.setMarkingLayout('olympic');
   rebuildScene('olympic');
-  // Start with ice prepped, auto mode on, practice session with skaters + crowds
+  // Start with ice prepped, auto mode on, zamboni running, practice session with skaters + crowds
   scene().prep();
   sidebar.setAutoMode(true);
   scene().scheduler.autoMode = true;
+  scene().switchMachine('zamboni');
+  scene().zamboni.start();
   scene().skaterSim.spawn('hockey', 12);
   scene().crowdDensity = 0.7;
 
